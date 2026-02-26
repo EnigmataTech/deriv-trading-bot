@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 from sqlalchemy import create_engine, Column, Integer, String, Text, Float, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 from typing import List, Optional
