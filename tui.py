@@ -319,7 +319,8 @@ class DerivTradingApp(App):
     async def refresh_balance(self) -> None:
         try:
             async with self._api_lock:
-                if not self._deriv.websocket:
+                if not self._deriv.websocket or self._deriv.websocket.closed:
+                    self._deriv.websocket = None
                     await self._deriv.connect()
                 resp = await self._deriv.get_account_balance()
             if "error" in resp:
@@ -341,11 +342,38 @@ class DerivTradingApp(App):
     async def refresh_open_trades(self) -> None:
         try:
             trades = TradingRepository.get_open_trades(TUI_USER_ID)
+
+            # Fetch live P&L + auto-close settled contracts
+            live_pnl: dict[str, float] = {}
+            try:
+                async with self._api_lock:
+                    if not self._deriv.websocket or self._deriv.websocket.closed:
+                        self._deriv.websocket = None
+                        await self._deriv.connect()
+                    for t in trades:
+                        try:
+                            resp = await self._deriv.get_contract_status(str(t.trade_id))
+                            poc = resp.get("proposal_open_contract", {})
+                            profit = poc.get("profit")
+                            if profit is not None:
+                                live_pnl[str(t.trade_id)] = float(profit)
+                            if poc.get("is_sold") or poc.get("status") == "sold":
+                                exit_price = float(poc.get("exit_tick") or poc.get("current_spot") or 0)
+                                TradingRepository.update_trade_result(
+                                    str(t.trade_id), float(poc.get("profit", 0)), exit_price
+                                )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Re-fetch to exclude any that just auto-closed
+            trades = TradingRepository.get_open_trades(TUI_USER_ID)
             table = self.query_one("#open-trades-table", DataTable)
             table.clear()
             self._open_trade_row_map = {}
             for t in trades:
-                pnl = t.profit_loss
+                pnl = live_pnl.get(str(t.trade_id), t.profit_loss)
                 if pnl is not None:
                     pnl_text = (
                         Text(f"+${pnl:.2f}", style="bold green")
@@ -595,7 +623,8 @@ class DerivTradingApp(App):
         self._log(f"Placing {direction} {symbol} ${amount:.2f} dur={duration}t...")
         try:
             async with self._api_lock:
-                if not self._deriv.websocket:
+                if not self._deriv.websocket or self._deriv.websocket.closed:
+                    self._deriv.websocket = None
                     await self._deriv.connect()
                 resp = await self._deriv.place_contract(
                     symbol=symbol, contract_type=direction,
@@ -629,7 +658,8 @@ class DerivTradingApp(App):
         self._log(f"Selling #{contract_id}...")
         try:
             async with self._api_lock:
-                if not self._deriv.websocket:
+                if not self._deriv.websocket or self._deriv.websocket.closed:
+                    self._deriv.websocket = None
                     await self._deriv.connect()
                 resp = await self._deriv.sell_contract(contract_id)
             if "error" in resp:
@@ -749,6 +779,7 @@ class DerivTradingApp(App):
         self.refresh_balance()
         self.refresh_open_trades()
         self.refresh_market_data()
+        self.refresh_history()
         self._log("Refreshing all data...")
 
     def action_toggle_help(self) -> None:
