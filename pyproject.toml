@@ -16,7 +16,8 @@ dependencies = [
     "numpy>=1.26.0",
     "requests>=2.31.0",
     "slowapi>=0.1.9",
+    "textual>=0.47.0",
 ]
 
 [tool.setuptools]
-py-modules = ["main", "database", "deriv_client", "logger", "trade_monitor"]
+py-modules = ["main", "database", "deriv_client", "logger", "trade_monitor", "tui"]
