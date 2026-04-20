@@ -96,6 +96,11 @@ class TradingRepository:
     def create_trade(user_id: str, trade_id: str, symbol: str, trade_type: str, amount: float, entry_price: float) -> Trade:
         db = SessionLocal()
         try:
+            # Check if trade already exists
+            existing_trade = db.query(Trade).filter_by(trade_id=trade_id).first()
+            if existing_trade:
+                return existing_trade
+
             trade = Trade(
                 user_id=user_id,
                 trade_id=trade_id,
@@ -225,6 +230,10 @@ class TradingRepository:
         """Create a trade with optional SL/TP settings."""
         db = SessionLocal()
         try:
+            # Check if trade already exists
+            existing_trade = db.query(Trade).filter_by(trade_id=trade_id).first()
+            if existing_trade:
+                return existing_trade
             # Initialize trailing stop price if trailing stop is set
             trailing_stop_price = None
             highest_price_seen = None

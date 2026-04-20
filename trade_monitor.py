@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
 from contextlib import asynccontextmanager
+from websockets.protocol import State
 
 from deriv_client import DerivAPIClient
 from database import Trade, SessionLocal, TradingRepository
@@ -92,6 +93,34 @@ class TradeMonitor:
             logger.error("Failed to start TradeMonitor: %s", e)
             raise TradeMonitorError(f"Failed to start TradeMonitor: {e}") from e
 
+    async def _ensure_connected(self) -> bool:
+        """
+        Ensure WebSocket is connected, reconnect if needed.
+
+        Returns:
+            bool: True if connected, False if reconnection failed after retries.
+        """
+        if not self.deriv_client.websocket or self.deriv_client.websocket.state != State.OPEN:
+            self.deriv_client.websocket = None
+            logger.warning("WebSocket connection lost, attempting to reconnect...")
+
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    connected = await self.deriv_client.connect()
+                    if connected:
+                        logger.info("Successfully reconnected to Deriv API")
+                        return True
+                    logger.warning("Reconnect attempt %d/%d failed", attempt + 1, self.MAX_RETRIES)
+                    await asyncio.sleep(self.RETRY_DELAY)
+                except Exception as e:
+                    logger.warning("Reconnect attempt %d/%d raised exception: %s", attempt + 1, self.MAX_RETRIES, e)
+                    await asyncio.sleep(self.RETRY_DELAY)
+
+            logger.error("Failed to reconnect after %d attempts", self.MAX_RETRIES)
+            return False
+
+        return True
+
     async def stop(self) -> None:
         """
         Stop the polling loop gracefully.
@@ -125,6 +154,12 @@ class TradeMonitor:
         """
         while self._running:
             try:
+                # Ensure connection before polling
+                if not await self._ensure_connected():
+                    logger.error("Lost connection to Deriv API, waiting before retry")
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
                 await self.check_open_trades()
                 # Also check stop levels for trades with SL/TP settings
                 await self.check_stop_levels()

@@ -1,6 +1,7 @@
 import json
 import asyncio
 import websockets
+from websockets.protocol import State
 import aiohttp
 from typing import Dict, Any, Optional, List
 import os
@@ -34,10 +35,12 @@ class DerivAPIClient:
         """Close WebSocket connection"""
         if self.websocket:
             await self.websocket.close()
+            self.websocket = None
     
     async def send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Send request to Deriv API and return response"""
-        if not self.websocket:
+        if not self.websocket or self.websocket.state != State.OPEN:
+            self.websocket = None
             await self.connect()
         
         request["req_id"] = self.request_id
