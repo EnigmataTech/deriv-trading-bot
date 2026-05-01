@@ -19,6 +19,7 @@ class DerivAPIClient:
         self.ws_url = f"wss://ws.binaryws.com/websockets/v3?app_id={self.app_id}"
         self.websocket = None
         self.request_id = 1
+        self._lock = asyncio.Lock()
         
     async def connect(self):
         """Establish WebSocket connection to Deriv API"""
@@ -38,17 +39,18 @@ class DerivAPIClient:
             self.websocket = None
     
     async def send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Send request to Deriv API and return response"""
-        if not self.websocket or self.websocket.state != State.OPEN:
-            self.websocket = None
-            await self.connect()
-        
-        request["req_id"] = self.request_id
-        self.request_id += 1
-        
-        await self.websocket.send(json.dumps(request))
-        response = await self.websocket.recv()
-        return json.loads(response)
+        """Send request to Deriv API and return response. Serialized via lock for shared-client safety."""
+        async with self._lock:
+            if not self.websocket or self.websocket.state != State.OPEN:
+                self.websocket = None
+                await self.connect()
+
+            request["req_id"] = self.request_id
+            self.request_id += 1
+
+            await self.websocket.send(json.dumps(request))
+            response = await self.websocket.recv()
+            return json.loads(response)
     
     async def authorize(self) -> Dict[str, Any]:
         """Authorize with API token"""
@@ -74,11 +76,15 @@ class DerivAPIClient:
         return await self.send_request(request)
     
     async def get_ticks(self, symbol: str) -> Dict[str, Any]:
-        """Get real-time ticks for a symbol"""
-        request = {
-            "ticks": symbol
-        }
-        return await self.send_request(request)
+        """Get the latest tick for a symbol using one-shot history (avoids subscription streams)."""
+        resp = await self.get_ticks_history(symbol, count=1)
+        # Reshape to match the tick response format callers expect
+        history = resp.get("history", {})
+        prices = history.get("prices", [])
+        epochs = history.get("times", [])
+        if prices:
+            return {"tick": {"quote": prices[-1], "epoch": epochs[-1] if epochs else 0, "symbol": symbol}}
+        return resp
     
     async def get_ticks_history(self, symbol: str, count: int = 100) -> Dict[str, Any]:
         """Get historical ticks"""
@@ -155,13 +161,40 @@ class DerivAPIClient:
         }
         return await self.send_request(request)
     
-    async def sell_contract(self, contract_id: str, price: Optional[float] = None) -> Dict[str, Any]:
-        """Sell an open contract"""
-        request = {
-            "sell": contract_id
+    async def place_multiplier_contract(
+        self,
+        symbol: str,
+        direction: str,
+        amount: float,
+        multiplier: int,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        currency: str = "USD",
+    ) -> Dict[str, Any]:
+        """Place a multiplier contract. direction: 'MULTUP' (long) or 'MULTDOWN' (short)."""
+        params: Dict[str, Any] = {
+            "contract_type": direction.upper(),
+            "symbol": symbol,
+            "amount": amount,
+            "multiplier": multiplier,
+            "basis": "stake",
+            "currency": currency,
         }
-        if price:
-            request["price"] = price
+        limit_order: Dict[str, Any] = {}
+        if stop_loss is not None and stop_loss > 0:
+            limit_order["stop_loss"] = {"order_type": "stop", "order_amount": stop_loss}
+        if take_profit is not None and take_profit > 0:
+            limit_order["take_profit"] = {"order_type": "limit", "order_amount": take_profit}
+        if limit_order:
+            params["limit_order"] = limit_order
+        return await self.send_request({"buy": 1, "price": amount, "parameters": params})
+
+    async def sell_contract(self, contract_id: str, price: Optional[float] = None) -> Dict[str, Any]:
+        """Sell an open contract at market price (price=0) or specified minimum price."""
+        request = {
+            "sell": int(contract_id),
+            "price": price if price is not None else 0,
+        }
         return await self.send_request(request)
 
 

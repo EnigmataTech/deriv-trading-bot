@@ -181,13 +181,17 @@ else:
 # Trade monitor instance (started on server startup)
 trade_monitor: Optional[TradeMonitor] = None
 
+MCP_AGENT_USER_ID = os.getenv("MCP_AGENT_USER_ID", "hermes_agent")
+
 def get_user_id() -> str:
     """Get user ID from context variable - raises error if not authenticated"""
     ctx_user_id = _current_user_id.get()
     if ctx_user_id:
         return ctx_user_id
-
-    # No fallback - authentication is required
+    # MCP tool calls have no REST context — use the configured agent identity
+    agent_user_id = os.getenv("MCP_AGENT_USER_ID")
+    if agent_user_id:
+        return agent_user_id
     raise ValueError("No authenticated user in context")
 
 def extract_user_from_request(request: StarletteRequest) -> Optional[str]:
@@ -357,14 +361,24 @@ def validate_trade_params(body: dict) -> tuple[Optional[dict], Optional[JSONResp
     if direction not in ["CALL", "PUT"]:
         errors.append("direction must be CALL or PUT")
 
-    # Duration validation
+    # Duration unit validation (t=ticks 1-10, s=seconds 5-3600, m=minutes 1-1440)
+    duration_unit = body.get("duration_unit", "s").lower()
+    if duration_unit not in ("t", "s", "m"):
+        errors.append("duration_unit must be t (ticks), s (seconds), or m (minutes)")
+        duration_unit = "s"
+
+    # Duration validation — limits depend on unit
     try:
-        duration = int(body.get("duration", 5))
-        if duration < 1 or duration > 600:
-            errors.append("duration must be between 1 and 600")
+        duration = int(body.get("duration", 60))
+        if duration_unit == "t" and (duration < 1 or duration > 10):
+            errors.append("tick duration must be between 1 and 10")
+        elif duration_unit == "s" and (duration < 5 or duration > 3600):
+            errors.append("second duration must be between 5 and 3600")
+        elif duration_unit == "m" and (duration < 1 or duration > 1440):
+            errors.append("minute duration must be between 1 and 1440")
     except (ValueError, TypeError):
         errors.append("invalid duration format")
-        duration = 5
+        duration = 60
 
     # Stop-loss validation (optional)
     stop_loss = None
@@ -408,16 +422,23 @@ def validate_trade_params(body: dict) -> tuple[Optional[dict], Optional[JSONResp
         "amount": amount,
         "direction": direction,
         "duration": duration,
+        "duration_unit": duration_unit,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "trailing_stop_distance": trailing_stop_distance
     }, None
 
+_shared_client: Optional[DerivAPIClient] = None
+
 async def get_deriv_client() -> DerivAPIClient:
-    """Helper function to get connected Deriv client"""
-    client = DerivAPIClient()
-    await client.connect()
-    return client
+    """Return a shared, persistent Deriv WebSocket client, reconnecting if needed."""
+    global _shared_client
+    from websockets.protocol import State
+    if _shared_client is None:
+        _shared_client = DerivAPIClient()
+    if not _shared_client.websocket or _shared_client.websocket.state != State.OPEN:
+        await _shared_client.connect()
+    return _shared_client
 
 # ============ Business Logic Functions (shared by MCP tools and REST endpoints) ============
 
@@ -444,7 +465,7 @@ async def _do_get_balance() -> str:
 
         return f"Balance: ${balance_data.get('balance', 'N/A')} {balance_data.get('currency', 'USD')}"
     finally:
-        await client.disconnect()
+        pass
 
 def _do_get_trade_history() -> str:
     """Get trade history for current user"""
@@ -465,7 +486,8 @@ async def _do_place_trade_async(
     symbol: str,
     amount: float,
     direction: str,
-    duration: int = 5,
+    duration: int = 60,
+    duration_unit: str = "s",
     stop_loss: Optional[float] = None,
     take_profit: Optional[float] = None,
     trailing_stop_distance: Optional[float] = None
@@ -490,7 +512,7 @@ async def _do_place_trade_async(
     client = await get_deriv_client()
     try:
         contract_type = "CALL" if direction.upper() == "CALL" else "PUT"
-        response = await client.place_contract(symbol, contract_type, amount, duration)
+        response = await client.place_contract(symbol, contract_type, amount, duration, duration_unit=duration_unit)
 
         if 'error' in response:
             error_msg = response['error']['message']
@@ -511,6 +533,20 @@ async def _do_place_trade_async(
 
         if contract_id:
             entry_price = float(buy_data.get('start_spot', 0))
+            # start_spot is often absent — try contract status, then live tick
+            if entry_price == 0:
+                try:
+                    status_resp = await client.get_contract_status(str(contract_id))
+                    poc = status_resp.get('proposal_open_contract', {})
+                    entry_price = float(poc.get('entry_spot') or poc.get('entry_tick') or 0)
+                except Exception:
+                    pass
+            if entry_price == 0:
+                try:
+                    tick_resp = await client.get_ticks(symbol)
+                    entry_price = float(tick_resp.get('tick', {}).get('quote', 0))
+                except Exception:
+                    pass
 
             # Store trade in database with SL/TP settings
             TradingRepository.create_trade_with_sl_tp(
@@ -558,7 +594,7 @@ async def _do_place_trade_async(
             log_error(Exception("No contract ID returned"), "place_trade", error_code="NO_CONTRACT_ID")
             return "Trade placement failed - no contract ID returned"
     finally:
-        await client.disconnect()
+        pass
 
 def _do_place_trade(symbol: str, amount: float, direction: str, duration: int = 5) -> str:
     """Place a binary options trade - sync wrapper for MCP tools"""
@@ -584,7 +620,7 @@ def get_market_data(symbol: str) -> str:
             tick_data = response.get('tick', {})
             return f"Symbol: {symbol}\nPrice: {tick_data.get('quote', 'N/A')}\nTime: {tick_data.get('epoch', 'N/A')}"
         finally:
-            await client.disconnect()
+            pass
     
     return asyncio.run(_get_market_data())
 
@@ -629,7 +665,7 @@ def calculate_technical_indicators(symbol: str, indicator: str, period: int = 14
                 return f"Unsupported indicator: {indicator}. Available: sma, rsi"
         
         finally:
-            await client.disconnect()
+            pass
     
     return asyncio.run(_calculate_indicators())
 
@@ -690,7 +726,7 @@ def get_active_symbols() -> str:
             
             return result
         finally:
-            await client.disconnect()
+            pass
     
     return asyncio.run(_get_symbols())
 
@@ -724,7 +760,7 @@ async def _do_get_market_data(symbol: str) -> str:
         tick_data = response.get('tick', {})
         return f"Symbol: {symbol}\nPrice: {tick_data.get('quote', 'N/A')}\nTime: {tick_data.get('epoch', 'N/A')}"
     finally:
-        await client.disconnect()
+        pass
 
 @mcp.custom_route("/api/market-data/{symbol}", methods=["GET"])
 async def api_get_market_data(request: StarletteRequest) -> JSONResponse:
@@ -812,11 +848,130 @@ async def api_get_candles(request: StarletteRequest) -> JSONResponse:
                 "candles": formatted_candles
             })
         finally:
-            await client.disconnect()
+            pass
 
     except Exception as e:
         log_error(e, "api_get_candles")
         return JSONResponse({"success": False, "error": f"Failed to retrieve candle data: {str(e)}"}, status_code=500)
+
+# Multipliers available per symbol
+SYMBOL_MULTIPLIERS: dict[str, list[int]] = {
+    "R_10":     [100, 200, 500],
+    "R_25":     [50, 100, 200],
+    "R_50":     [80, 200, 400, 600, 800],
+    "R_75":     [20, 50, 100],
+    "R_100":    [40, 100, 200, 300, 400],
+    "1HZ10V":   [100, 200, 500],
+    "1HZ25V":   [50, 100, 200],
+    "1HZ50V":   [80, 200, 400, 600, 800],
+    "1HZ75V":   [20, 50, 100],
+    "1HZ100V":  [40, 100, 200, 300, 400],
+}
+
+async def _do_place_multiplier_async(
+    symbol: str,
+    direction: str,
+    amount: float,
+    multiplier: int,
+    stop_loss = None,
+    take_profit = None,
+) -> str:
+    from typing import Optional
+    user_id = get_user_id()
+    can_trade, limit_error = check_daily_loss_limit(user_id)
+    if not can_trade:
+        return f"Trade blocked: {limit_error}"
+
+    valid = SYMBOL_MULTIPLIERS.get(symbol, [])
+    if valid and multiplier not in valid:
+        return f"Invalid multiplier {multiplier}x for {symbol}. Valid: {valid}"
+
+    contract_type = "MULTUP" if direction.upper() in ("BUY", "MULTUP") else "MULTDOWN"
+    client = await get_deriv_client()
+    response = await client.place_multiplier_contract(
+        symbol, contract_type, amount, multiplier, stop_loss, take_profit
+    )
+
+    if "error" in response:
+        return f"Error placing multiplier trade: {response['error']['message']}"
+
+    buy_data = response.get("buy", {})
+    contract_id = buy_data.get("contract_id")
+    if not contract_id:
+        return "Multiplier trade failed — no contract ID returned"
+
+    entry_price = 0.0
+    try:
+        tick_resp = await client.get_ticks(symbol)
+        entry_price = float(tick_resp.get("tick", {}).get("quote", 0))
+    except Exception:
+        pass
+
+    buy_price = float(buy_data.get("buy_price", amount))
+    TradingRepository.create_trade_with_sl_tp(
+        user_id=user_id, trade_id=str(contract_id), symbol=symbol,
+        trade_type=contract_type.lower(), amount=buy_price, entry_price=entry_price,
+        stop_loss=stop_loss, take_profit=take_profit,
+    )
+    log_trade_placed(symbol=symbol, amount=amount, direction=direction.upper(), contract_type=contract_type, duration=0, trade_id=str(contract_id))
+    log_audit_trade(event_type="place", user_id=user_id, trade_id=str(contract_id),
+                    symbol=symbol, amount=amount, direction=direction.upper(), success=True)
+
+    result = (f"Multiplier trade placed! #{contract_id} | "
+              f"{symbol} {direction.upper()} ${buy_price:.2f} @ {multiplier}x "
+              f"(exposure: ${buy_price * multiplier:.2f})")
+    if stop_loss:
+        result += f" | SL: ${stop_loss}"
+    if take_profit:
+        result += f" | TP: ${take_profit}"
+    return result
+
+
+@mcp.custom_route("/api/trade/multiplier", methods=["POST"])
+async def api_place_multiplier(request: StarletteRequest) -> JSONResponse:
+    """Place a multiplier (CFD-style) contract."""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
+    ctx_token = _current_user_id.set(user_id)
+    try:
+        body = await request.json()
+        validated_symbol, sym_err = validate_symbol(body.get("symbol", ""))
+        if sym_err:
+            return JSONResponse({"success": False, "error": sym_err}, status_code=400)
+        direction = body.get("direction", "").upper()
+        if direction not in ("BUY", "SELL", "MULTUP", "MULTDOWN"):
+            return JSONResponse({"success": False, "error": "direction must be BUY or SELL"}, status_code=400)
+        try:
+            amount = float(body.get("amount", 0))
+            if amount < 1.00:
+                return JSONResponse({"success": False, "error": "amount must be at least $1.00 for multiplier contracts"}, status_code=400)
+        except (ValueError, TypeError):
+            return JSONResponse({"success": False, "error": "invalid amount"}, status_code=400)
+        try:
+            multiplier = int(body.get("multiplier", 0))
+        except (ValueError, TypeError):
+            return JSONResponse({"success": False, "error": "invalid multiplier"}, status_code=400)
+        sl = float(body["stop_loss"]) if body.get("stop_loss") else None
+        tp = float(body["take_profit"]) if body.get("take_profit") else None
+        result = await _do_place_multiplier_async(validated_symbol, direction, amount, multiplier, sl, tp)
+        log_api_call("/api/trade/multiplier", "POST", 200)
+        # Return error if business logic returned an error string
+        if result.startswith(("Error", "Trade blocked", "Invalid", "Multiplier trade failed")):
+            return JSONResponse({"success": False, "error": result}, status_code=400)
+        return JSONResponse({"success": True, "data": result})
+    except Exception as e:
+        log_error(e, "api_place_multiplier")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+    finally:
+        _current_user_id.reset(ctx_token)
+
+
+@mcp.custom_route("/api/multipliers/{symbol}", methods=["GET"])
+def api_get_multipliers(request: StarletteRequest) -> JSONResponse:
+    symbol = request.path_params["symbol"].upper()
+    multipliers = SYMBOL_MULTIPLIERS.get(symbol, [])
+    return JSONResponse({"success": True, "symbol": symbol, "multipliers": multipliers})
 
 @mcp.custom_route("/api/trade", methods=["POST"])
 async def api_place_trade(request: StarletteRequest) -> JSONResponse:
@@ -841,6 +996,7 @@ async def api_place_trade(request: StarletteRequest) -> JSONResponse:
             params["amount"],
             params["direction"],
             params["duration"],
+            duration_unit=params.get("duration_unit", "s"),
             stop_loss=params.get("stop_loss"),
             take_profit=params.get("take_profit"),
             trailing_stop_distance=params.get("trailing_stop_distance")
@@ -892,8 +1048,8 @@ async def api_sell_contract(request: StarletteRequest) -> JSONResponse:
                 }, status_code=500)
 
             sell_data = response.get('sell', {})
-            sold_for = sell_data.get('sold_for', 0)
-            profit_loss = float(sold_for) - trade.amount
+            sold_for = float(sell_data.get('sold_for', 0))
+            profit_loss = float(sell_data.get('profit', sold_for - trade.amount))
 
             # Update trade in database
             TradingRepository.update_trade_result(
@@ -913,7 +1069,7 @@ async def api_sell_contract(request: StarletteRequest) -> JSONResponse:
                 }
             })
         finally:
-            await client.disconnect()
+            pass
 
     except Exception as e:
         log_error(e, "api_sell_contract")
@@ -973,7 +1129,7 @@ async def api_sync_trades(request: StarletteRequest) -> JSONResponse:
         _current_user_id.reset(ctx_token)
 
 @mcp.custom_route("/api/indicators/{symbol}", methods=["GET"])
-def api_get_indicators(request: StarletteRequest) -> JSONResponse:
+async def api_get_indicators(request: StarletteRequest) -> JSONResponse:
     """REST endpoint for calculating technical indicators"""
     user_id, error_response = require_auth(request)
     if error_response:
@@ -996,7 +1152,23 @@ def api_get_indicators(request: StarletteRequest) -> JSONResponse:
         except ValueError:
             return JSONResponse({"success": False, "error": "invalid period format"}, status_code=400)
 
-        result = calculate_technical_indicators(validated_symbol, indicator, period)
+        # Use shared async client directly to avoid asyncio.run() cross-loop issues
+        client = await get_deriv_client()
+        response = await client.get_ticks_history(validated_symbol, count=100)
+        if "error" in response:
+            return JSONResponse({"success": False, "error": response["error"]["message"]}, status_code=500)
+        prices = [float(p) for p in response.get("history", {}).get("prices", [])]
+        if len(prices) < period:
+            result = f"Not enough data for {indicator} calculation. Need at least {period} data points."
+        elif indicator == "rsi":
+            values = TechnicalIndicators.calculate_rsi(prices, period)
+            latest = values[-1] if values and values[-1] is not None else None
+            result = f"RSI({period}) for {validated_symbol}: {latest:.2f}" if latest is not None else f"RSI({period}) for {validated_symbol}: N/A"
+        else:
+            values = TechnicalIndicators.calculate_sma(prices, period)
+            latest = values[-1] if values and values[-1] is not None else None
+            result = f"SMA({period}) for {validated_symbol}: {latest:.5f}" if latest is not None else f"SMA({period}) for {validated_symbol}: N/A"
+
         log_api_call(f"/api/indicators/{validated_symbol}", "GET", 200)
         return JSONResponse({"success": True, "data": result, "symbol": validated_symbol, "indicator": indicator, "period": period})
     except Exception as e:
@@ -1152,16 +1324,12 @@ async def api_check_trades(request: StarletteRequest) -> JSONResponse:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
 @mcp.custom_route("/api/trades/summary", methods=["GET"])
-def api_trades_summary(request: StarletteRequest) -> JSONResponse:
+async def api_trades_summary(request: StarletteRequest) -> JSONResponse:
     """Get trade summary for the current user"""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
     try:
-        user_id = extract_user_from_request(request)
-        if AUTH_ENABLED and not user_id:
-            return JSONResponse({"success": False, "error": "Authentication required"}, status_code=401)
-
-        if not user_id:
-            user_id = "test_user_123"
-
         summary = TradingRepository.get_trades_summary(user_id)
         return JSONResponse({"success": True, "data": summary})
     except Exception as e:
@@ -1197,9 +1365,34 @@ def api_trades_list(request: StarletteRequest) -> JSONResponse:
         log_error(e, "api_trades_list")
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
+@mcp.custom_route("/api/trades/agent", methods=["GET"])
+def api_agent_trades(request: StarletteRequest) -> JSONResponse:
+    """Get recent trades placed by the MCP agent — no auth required so TUI can poll it"""
+    try:
+        trades = TradingRepository.get_trades_by_user(MCP_AGENT_USER_ID)
+        trade_list = []
+        for trade in trades:
+            trade_list.append({
+                "id": trade.id,
+                "trade_id": trade.trade_id,
+                "symbol": trade.symbol,
+                "type": trade.trade_type,
+                "amount": trade.amount,
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "profit_loss": trade.profit_loss,
+                "status": trade.status,
+                "created_at": trade.created_at.isoformat() if trade.created_at else None,
+                "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
+            })
+        return JSONResponse({"success": True, "agent_user_id": MCP_AGENT_USER_ID, "trades": trade_list})
+    except Exception as e:
+        log_error(e, "api_agent_trades")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
 @mcp.custom_route("/api/trades/open", methods=["GET"])
 async def api_open_trades(request: StarletteRequest) -> JSONResponse:
-    """Get open trades with current prices and unrealized P&L"""
+    """Get open trades with real-time P&L from Deriv contract status. Auto-closes settled contracts."""
     user_id, error_response = require_auth(request)
     if error_response:
         return error_response
@@ -1210,50 +1403,46 @@ async def api_open_trades(request: StarletteRequest) -> JSONResponse:
         if not open_trades:
             return JSONResponse({"success": True, "trades": [], "total_unrealized_pnl": 0})
 
-        # Get current prices for each symbol
         client = await get_deriv_client()
         try:
             trade_list = []
             total_unrealized_pnl = 0
 
-            # Group trades by symbol to minimize API calls
-            symbols = set(t.symbol for t in open_trades)
-            current_prices = {}
-
-            for symbol in symbols:
-                try:
-                    response = await client.get_ticks(symbol)
-                    if 'tick' in response:
-                        current_prices[symbol] = float(response['tick'].get('quote', 0))
-                except Exception as e:
-                    logger.warning(f"Failed to get price for {symbol}: {e}")
-                    current_prices[symbol] = 0
-
             for trade in open_trades:
-                current_price = current_prices.get(trade.symbol, 0)
-                entry_price = trade.entry_price or 0
+                unrealized_pnl = 0.0
+                current_price = 0.0
+                entry_price = float(trade.entry_price or 0)
 
-                # Calculate unrealized P&L based on trade direction
-                if entry_price > 0 and current_price > 0:
-                    if trade.trade_type.lower() == 'call':
-                        # CALL profits when price goes up
-                        price_diff = current_price - entry_price
-                    else:
-                        # PUT profits when price goes down
-                        price_diff = entry_price - current_price
+                try:
+                    status_resp = await client.get_contract_status(str(trade.trade_id))
+                    poc = status_resp.get('proposal_open_contract', {})
 
-                    # For binary options, P&L is based on whether it's winning
-                    # Simplified: if in profit direction, potential win is ~95% of stake
-                    # if against, potential loss is the stake amount
-                    if price_diff > 0:
-                        unrealized_pnl = trade.amount * 0.95  # Approximate payout
-                    else:
-                        unrealized_pnl = -trade.amount
-                else:
-                    unrealized_pnl = 0
+                    # Use Deriv's actual profit value
+                    if poc.get('profit') is not None:
+                        unrealized_pnl = float(poc['profit'])
+                    if poc.get('current_spot'):
+                        current_price = float(poc['current_spot'])
+
+                    # Fix missing entry price
+                    if entry_price == 0 and (poc.get('entry_spot') or poc.get('entry_tick')):
+                        entry_price = float(poc.get('entry_spot') or poc.get('entry_tick') or 0)
+                        if entry_price:
+                            TradingRepository.update_trade_result(
+                                trade.trade_id, entry_price, None, status='open'
+                            )
+
+                    # Auto-close settled contracts
+                    if (poc.get('is_sold') or poc.get('is_expired') or poc.get('status') in ('sold', 'won', 'lost', 'expired') or (poc.get('profit') is not None and not poc.get('is_valid_to_sell', 1))):
+                        final_pnl = float(poc.get('profit', 0))
+                        exit_price = float(poc.get('exit_tick') or poc.get('current_spot') or 0)
+                        TradingRepository.update_trade_result(trade.trade_id, exit_price, final_pnl)
+                        logger.info(f"Auto-closed contract {trade.trade_id}: P&L ${final_pnl:.2f}")
+                        continue  # Don't include in open trades response
+
+                except Exception as e:
+                    logger.warning(f"Contract status error for {trade.trade_id}: {e}")
 
                 total_unrealized_pnl += unrealized_pnl
-
                 trade_list.append({
                     "id": trade.id,
                     "trade_id": trade.trade_id,
@@ -1276,7 +1465,7 @@ async def api_open_trades(request: StarletteRequest) -> JSONResponse:
                 "total_unrealized_pnl": round(total_unrealized_pnl, 2)
             })
         finally:
-            await client.disconnect()
+            pass
 
     except Exception as e:
         log_error(e, "api_open_trades")
