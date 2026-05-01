@@ -47,14 +47,14 @@ load_dotenv()
 API_BASE = os.getenv("TRADING_API_URL", "http://trading.enigmata.local").rstrip("/")
 MCP_AGENT_USER_ID = os.getenv("MCP_AGENT_USER_ID", "hermes_agent")
 
-DEFAULT_SYMBOLS = ["R_50", "R_100", "1HZ50V", "1HZ100V"]
+DEFAULT_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V"]
 
 ALLOWED_SYMBOLS = sorted([
+    # Standard volatility indices
     "R_10", "R_25", "R_50", "R_75", "R_100",
-    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
-    "JD10", "JD25", "JD50", "JD75", "JD100",
-    "BOOM300N", "BOOM500", "BOOM1000",
-    "CRASH300N", "CRASH500", "CRASH1000",
+    # 1-second volatility indices (all available)
+    "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V",
+    "1HZ50V", "1HZ75V", "1HZ90V", "1HZ100V",
 ])
 
 QUICK_TRADES: dict[str, tuple[str, str, float]] = {
@@ -79,11 +79,20 @@ QUICK_MULTIPLIERS: dict[str, tuple[str, str, float, int]] = {
 }
 
 SYMBOL_MULTIPLIERS: dict[str, list[int]] = {
-    "R_10": [100, 200, 500], "R_25": [50, 100, 200],
-    "R_50": [80, 200, 400, 600, 800], "R_75": [20, 50, 100],
+    # Standard volatility
+    "R_10":  [100, 200, 500],
+    "R_25":  [50, 100, 200],
+    "R_50":  [80, 200, 400, 600, 800],
+    "R_75":  [20, 50, 100],
     "R_100": [40, 100, 200, 300, 400],
-    "1HZ10V": [100, 200, 500], "1HZ25V": [50, 100, 200],
-    "1HZ50V": [80, 200, 400, 600, 800], "1HZ75V": [20, 50, 100],
+    # 1-second volatility
+    "1HZ10V":  [100, 200, 500],
+    "1HZ15V":  [300, 1000, 1500, 2000, 3000],
+    "1HZ25V":  [50, 100, 200],
+    "1HZ30V":  [140, 400, 700, 1000, 1400],
+    "1HZ50V":  [80, 200, 400, 600, 800],
+    "1HZ75V":  [20, 50, 100],
+    "1HZ90V":  [45, 100, 200, 300, 450],
     "1HZ100V": [40, 100, 200, 300, 400],
 }
 
