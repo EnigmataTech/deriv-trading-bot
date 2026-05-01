@@ -157,8 +157,8 @@ class TradeDetailModal(ModalScreen):
                             yield Static(value,        classes="detail-value")
             yield Rule()
             with Horizontal(id="modal-buttons"):
-                if is_open and is_multiplier and self._on_close:
-                    yield Button("✕  Close Position", id="modal-close-trade", variant="error")
+                yield Button("✕  Close Position", id="modal-close-trade", variant="error",
+                             disabled=not is_open)
                 yield Button("Dismiss", id="modal-dismiss", variant="default")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -166,9 +166,10 @@ class TradeDetailModal(ModalScreen):
             self.dismiss()
         elif event.button.id == "modal-close-trade":
             trade_id = str(self._trade.get("trade_id", ""))
+            callback = self._on_close
             self.dismiss()
-            if self._on_close:
-                await self._on_close(trade_id)
+            if callback:
+                await callback(trade_id)
 
 
 # ─── Main Application ─────────────────────────────────────────────────────────
@@ -263,6 +264,7 @@ class DerivTradingApp(App):
         Binding("1", "switch_tab('tab-dashboard')", "Dashboard"),
         Binding("2", "switch_tab('tab-place')",     "Trade"),
         Binding("3", "switch_tab('tab-history')",   "History"),
+        Binding("c", "close_trade",         "Close Trade"),
         Binding("r", "refresh_all",         "Refresh"),
         Binding("a", "toggle_auto_refresh", "Auto"),
         Binding("ctrl+l", "clear_log",      "Clear Log"),
@@ -285,6 +287,10 @@ class DerivTradingApp(App):
         self._trade_direction: str = "BUY"    # BUY/SELL for multiplier, CALL/PUT for binary
         self._multiplier: int = 80
         self._modal_open: bool = False
+        self._timer_ticks: Optional[Timer] = None
+        self._mkt_col_price: Any = None
+        self._mkt_col_change: Any = None
+        self._mkt_row_keys: dict[str, Any] = {}   # symbol → RowKey
 
     # ─── Layout ──────────────────────────────────────────────────────────────
 
@@ -404,7 +410,9 @@ class DerivTradingApp(App):
 
     def on_mount(self) -> None:
         mt = self.query_one("#market-table",      DataTable)
-        mt.add_columns("Symbol", "Price", "Change", "RSI", "SMA(14)")
+        _cols = mt.add_columns("Symbol", "Price", "Change", "RSI", "SMA(14)")
+        self._mkt_col_price  = _cols[1]
+        self._mkt_col_change = _cols[2]
         mt.border_title = "Market Watch"
 
         ot = self.query_one("#open-trades-table", DataTable)
@@ -448,6 +456,7 @@ class DerivTradingApp(App):
         await self._fetch_agent_activity()
         await self._fetch_history()
 
+        self._timer_ticks   = self.set_interval(1,  self.refresh_ticks)
         self._timer_balance = self.set_interval(30, self.refresh_balance)
         self._timer_open    = self.set_interval(3,  self.refresh_open_trades)
         self._timer_market  = self.set_interval(5, self.refresh_market_data)
@@ -455,6 +464,53 @@ class DerivTradingApp(App):
         self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
 
     # ─── Data fetchers ────────────────────────────────────────────────────────
+
+    async def _fetch_ticks(self) -> None:
+        """Pull live prices from the server tick cache, update sparklines and market table."""
+        try:
+            resp = await api_get("/api/prices")
+            if not resp.get("success"):
+                return
+            prices = resp.get("prices", {})
+            if not prices:
+                return
+
+            table = self.query_one("#market-table", DataTable)
+
+            for symbol in DEFAULT_SYMBOLS:
+                price = prices.get(symbol)
+                if price is None:
+                    continue
+                price = float(price)
+                history = self._price_history.get(symbol, [])
+                history.append(price)
+                self._price_history[symbol] = history[-120:]
+
+                # Update sparkline
+                try:
+                    self.query_one(f"#sparkline-{symbol}", Sparkline).data = history[-40:]
+                except Exception:
+                    pass
+
+                # Update Price and Change columns in market table
+                rk = self._mkt_row_keys.get(symbol)
+                if rk and self._mkt_col_price and self._mkt_col_change and len(history) >= 2:
+                    try:
+                        change = history[-1] - history[-2]
+                        change_text = (
+                            Text(f"▲ +{change:.5f}", style="bold green") if change >= 0
+                            else Text(f"▼ {change:.5f}", style="bold red")
+                        )
+                        table.update_cell(rk, self._mkt_col_price,  f"{price:.5f}")
+                        table.update_cell(rk, self._mkt_col_change, change_text)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    @work(exclusive=True)
+    async def refresh_ticks(self) -> None:
+        await self._fetch_ticks()
 
     async def _fetch_balance(self) -> None:
         try:
@@ -586,38 +642,24 @@ class DerivTradingApp(App):
                         else Text(f"▼ {change:.5f}", style="bold red")
                     )
 
-                # Indicators — use candle data if available, else fall back to server indicator API
+                # Calculate indicators from accumulated price history (includes live ticks)
                 rsi_text = Text("—")
                 sma_str = "—"
-                indicator_prices = close_prices if len(close_prices) >= 15 else None
-
-                if indicator_prices:
+                # Use the running tick history — grows with every 1-second tick update
+                all_prices = self._price_history.get(symbol, [])
+                indicator_src = all_prices if len(all_prices) >= 15 else (
+                    close_prices if len(close_prices) >= 15 else None
+                )
+                if indicator_src:
                     from deriv_client import TechnicalIndicators
-                    rsi_list = TechnicalIndicators.calculate_rsi(indicator_prices)
-                    sma_list = TechnicalIndicators.calculate_sma(indicator_prices, 14)
+                    rsi_list = TechnicalIndicators.calculate_rsi(indicator_src)
+                    sma_list = TechnicalIndicators.calculate_sma(indicator_src, 14)
                     if rsi_list and rsi_list[-1] is not None:
                         rsi_val = rsi_list[-1]
                         style = "bold red" if rsi_val > 70 else ("bold green" if rsi_val < 30 else "yellow")
                         rsi_text = Text(f"{rsi_val:.1f}", style=style)
                     if sma_list and sma_list[-1] is not None:
                         sma_str = f"{sma_list[-1]:.5f}"
-                else:
-                    # Fallback: use server indicator API (works for 1s indices via tick history)
-                    rsi_resp = await api_get(f"/api/indicators/{symbol}?indicator=rsi&period=14")
-                    sma_resp = await api_get(f"/api/indicators/{symbol}?indicator=sma&period=14")
-                    if rsi_resp.get("success"):
-                        try:
-                            rsi_val = float(rsi_resp["data"].split(":")[-1].strip())
-                            style = "bold red" if rsi_val > 70 else ("bold green" if rsi_val < 30 else "yellow")
-                            rsi_text = Text(f"{rsi_val:.1f}", style=style)
-                        except (ValueError, KeyError, AttributeError):
-                            pass
-                    if sma_resp.get("success"):
-                        try:
-                            raw = sma_resp["data"].split(":")[-1].strip()
-                            sma_str = f"{float(raw):.5f}"
-                        except (ValueError, KeyError, AttributeError):
-                            pass
 
                 rows.append((label, f"{price:.5f}", change_text, rsi_text, sma_str))
 
@@ -631,8 +673,10 @@ class DerivTradingApp(App):
         try:
             table = self.query_one("#market-table", DataTable)
             table.clear()
-            for row in rows:
-                table.add_row(*row)
+            self._mkt_row_keys.clear()
+            for symbol, row in zip(DEFAULT_SYMBOLS, rows):
+                rk = table.add_row(*row, key=symbol)
+                self._mkt_row_keys[symbol] = rk
             for symbol, data in sparklines.items():
                 try:
                     self.query_one(f"#sparkline-{symbol}", Sparkline).data = data
@@ -946,8 +990,8 @@ class DerivTradingApp(App):
             self.refresh_history()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "open-trades-table":
-            return
+        # Row keys in open trades table are trade_id strings; other tables use symbol names
+        # or auto-generated keys — so this lookup is safe without an ID check
         trade = self._open_trade_rows.get(str(event.row_key.value))
         if trade:
             self.push_screen(TradeDetailModal(trade, on_close=self._close_trade))
@@ -956,6 +1000,24 @@ class DerivTradingApp(App):
 
     def action_switch_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
+
+    async def action_close_trade(self) -> None:
+        """Close the currently highlighted row in the Open Positions table."""
+        try:
+            table = self.query_one("#open-trades-table", DataTable)
+            row_keys = list(table.rows.keys())
+            if not row_keys or table.cursor_row >= len(row_keys):
+                self._log("[yellow]No trade selected to close.[/yellow]")
+                return
+            rk = row_keys[table.cursor_row]
+            trade = self._open_trade_rows.get(str(rk.value))
+            if not trade:
+                self._log("[yellow]Select a row in Open Positions then press C.[/yellow]")
+                return
+            trade_id = str(trade.get("trade_id", ""))
+            await self._close_trade(trade_id)
+        except Exception as e:
+            self._log(f"[red]Close error: {e}[/red]")
 
     def action_scroll_down_table(self) -> None:
         try:
@@ -978,9 +1040,10 @@ class DerivTradingApp(App):
 
     def action_toggle_auto_refresh(self) -> None:
         self._auto_refresh = not self._auto_refresh
-        timers = [self._timer_balance, self._timer_open, self._timer_market,
+        timers = [self._timer_ticks, self._timer_balance, self._timer_open, self._timer_market,
                   self._timer_history, self._timer_agent]
         if self._auto_refresh:
+            self._timer_ticks   = self.set_interval(1,  self.refresh_ticks)
             self._timer_balance = self.set_interval(30, self.refresh_balance)
             self._timer_open    = self.set_interval(3,  self.refresh_open_trades)
             self._timer_market  = self.set_interval(5, self.refresh_market_data)

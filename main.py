@@ -429,6 +429,7 @@ def validate_trade_params(body: dict) -> tuple[Optional[dict], Optional[JSONResp
     }, None
 
 _shared_client: Optional[DerivAPIClient] = None
+_tick_stream: Optional[object] = None  # DerivTickStream instance
 
 async def get_deriv_client() -> DerivAPIClient:
     """Return a shared, persistent Deriv WebSocket client, reconnecting if needed."""
@@ -1208,6 +1209,28 @@ def api_get_symbols(request: StarletteRequest) -> JSONResponse:
     except Exception as e:
         log_error(e, "api_get_symbols")
         return JSONResponse({"success": False, "error": "Failed to retrieve symbols"}, status_code=500)
+
+
+
+
+
+
+
+
+
+TICK_SYMBOLS = ["R_50", "R_100", "1HZ50V", "1HZ100V"]
+
+@mcp.custom_route("/api/prices", methods=["GET"])
+async def api_prices(request: StarletteRequest) -> JSONResponse:
+    """Cached live tick prices. Starts the Deriv subscription on first call."""
+    global _tick_stream
+    if _tick_stream is None:
+        from deriv_client import DerivTickStream
+        _tick_stream = DerivTickStream()
+        asyncio.create_task(_tick_stream.run(TICK_SYMBOLS))
+        logger.info(f"Tick stream started for {TICK_SYMBOLS}")
+    return JSONResponse({"success": True, "prices": _tick_stream.prices})
+
 
 @mcp.custom_route("/health", methods=["GET"])
 def health_check(request: StarletteRequest) -> JSONResponse:

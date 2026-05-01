@@ -246,3 +246,45 @@ class TechnicalIndicators:
                 rsi.append(100 - (100 / (1 + rs)))
         
         return [round(r, 2) if r is not None else None for r in rsi]
+
+class DerivTickStream:
+    """Dedicated subscription client for real-time tick streaming.
+    Separate from DerivAPIClient so subscriptions never block request-response traffic."""
+
+    def __init__(self):
+        self.app_id = os.getenv("DERIV_APP_ID", "1089")
+        self.api_token = os.getenv("DERIV_API_TOKEN")
+        self.ws_url = f"wss://ws.binaryws.com/websockets/v3?app_id={self.app_id}"
+        self._prices: Dict[str, float] = {}
+        self._running = False
+
+    @property
+    def prices(self) -> Dict[str, float]:
+        return dict(self._prices)
+
+    async def run(self, symbols: List[str]) -> None:
+        """Subscribe to symbols and stream ticks into _prices cache. Reconnects on error."""
+        self._running = True
+        while self._running:
+            try:
+                ws = await websockets.connect(self.ws_url)
+                try:
+                    # Authenticate
+                    if self.api_token:
+                        await ws.send(json.dumps({"authorize": self.api_token, "req_id": 0}))
+                        await ws.recv()
+                    # Subscribe to all symbols at once
+                    for i, sym in enumerate(symbols, start=1):
+                        await ws.send(json.dumps({"ticks": sym, "subscribe": 1, "req_id": i}))
+                    # Stream incoming ticks
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        tick = msg.get("tick", {})
+                        sym = tick.get("symbol")
+                        quote = tick.get("quote")
+                        if sym and quote is not None:
+                            self._prices[sym] = float(quote)
+                finally:
+                    await ws.close()
+            except Exception:
+                await asyncio.sleep(5)  # back-off before reconnecting
