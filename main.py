@@ -7,6 +7,15 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse, Response
 from database import TradingRepository
 from deriv_client import DerivAPIClient, TechnicalIndicators
+from analytics import (
+    ClosedTrade,
+    calculate_trade_stats,
+    calculate_portfolio_stats,
+    calculate_per_symbol_stats,
+    streak_risk_assessment,
+    duration_quality_report,
+    _fmt_duration,
+)
 from logger import setup_logging, get_logger, log_trade_placed, log_trade_closed, log_api_call, log_error, log_balance_update, log_audit_auth, log_audit_trade
 from trade_monitor import TradeMonitor
 from jose import jwt
@@ -598,6 +607,124 @@ def _do_place_trade(symbol: str, amount: float, direction: str, duration: int = 
     """Place a binary options trade - sync wrapper for MCP tools"""
     return asyncio.run(_do_place_trade_async(symbol, amount, direction, duration))
 
+def _orm_to_closed_trades(trades) -> list:
+    """Convert SQLAlchemy Trade ORM objects to ClosedTrade dataclass instances."""
+    result = []
+    for t in trades:
+        if t.status != 'closed' or t.profit_loss is None or t.closed_at is None:
+            continue
+        result.append(ClosedTrade(
+            trade_id=t.trade_id,
+            symbol=t.symbol,
+            trade_type=t.trade_type,
+            amount=t.amount,
+            profit_loss=t.profit_loss,
+            opened_at=t.created_at,
+            closed_at=t.closed_at,
+        ))
+    return result
+
+
+def _compute_market_signal(symbol: str, prices: list) -> dict:
+    """Score-based composite signal: RSI / MACD-hist / BB-position summed to BUY/SELL/HOLD.
+    Caller is responsible for applying the streak-risk pause override."""
+    if len(prices) < 35:
+        return {
+            "symbol": symbol,
+            "current_price": prices[-1] if prices else None,
+            "rsi": None, "macd": None, "bb": None,
+            "composite_score": 0,
+            "call": "HOLD",
+            "reason": f"insufficient ticks ({len(prices)} < 35)",
+        }
+
+    current = prices[-1]
+
+    rsi_vals = TechnicalIndicators.calculate_rsi(prices, 14)
+    rsi_latest = next((x for x in reversed(rsi_vals) if x is not None), None)
+    if rsi_latest is None:
+        rsi_score, rsi_label = 0, "n/a"
+    elif rsi_latest < 30:
+        rsi_score, rsi_label = 1, "oversold"
+    elif rsi_latest > 70:
+        rsi_score, rsi_label = -1, "overbought"
+    else:
+        rsi_score, rsi_label = 0, "neutral"
+
+    _, _, hist = TechnicalIndicators.calculate_macd(prices)
+    hist_latest = next((x for x in reversed(hist) if x is not None), None)
+    if hist_latest is None:
+        macd_score, macd_label = 0, "n/a"
+    elif hist_latest > 0:
+        macd_score, macd_label = 1, "bullish"
+    elif hist_latest < 0:
+        macd_score, macd_label = -1, "bearish"
+    else:
+        macd_score, macd_label = 0, "flat"
+
+    upper, middle, lower = TechnicalIndicators.calculate_bollinger_bands(prices, period=20)
+    u = next((x for x in reversed(upper) if x is not None), None)
+    l = next((x for x in reversed(lower) if x is not None), None)
+    if u is None or l is None:
+        bb_score, bb_pos = 0, "n/a"
+    elif current < l:
+        bb_score, bb_pos = 1, "below-lower"
+    elif current > u:
+        bb_score, bb_pos = -1, "above-upper"
+    else:
+        bb_score, bb_pos = 0, "within"
+
+    score = rsi_score + macd_score + bb_score
+    if score >= 2:
+        call = "BUY"
+    elif score <= -2:
+        call = "SELL"
+    else:
+        call = "HOLD"
+
+    reason_parts = []
+    if rsi_label not in ("neutral", "n/a"):
+        reason_parts.append(f"RSI {rsi_label}")
+    if macd_label not in ("flat", "n/a"):
+        reason_parts.append(f"MACD {macd_label}")
+    if bb_pos not in ("within", "n/a"):
+        reason_parts.append(f"price {bb_pos} BB")
+    reason = ", ".join(reason_parts) if reason_parts else "no directional bias"
+
+    return {
+        "symbol": symbol,
+        "current_price": current,
+        "rsi": {"value": rsi_latest, "score": rsi_score, "label": rsi_label},
+        "macd": {"hist": hist_latest, "score": macd_score, "label": macd_label},
+        "bb": {"position": bb_pos, "score": bb_score, "upper": u, "lower": l},
+        "composite_score": score,
+        "call": call,
+        "reason": reason,
+    }
+
+
+def _portfolio_pause_status(user_id: str) -> dict:
+    """Compute the streak-risk pause override based on the user's closed trades."""
+    orm_trades = TradingRepository.get_trades_by_user(user_id)
+    closed = _orm_to_closed_trades(orm_trades)
+    if not closed:
+        return {"recommend_pause": False, "current_streak": 0,
+                "max_streak": 0, "threshold": 0, "reason": "no closed trades"}
+    ts = calculate_trade_stats(closed)
+    risk = streak_risk_assessment(ts)
+    return {
+        "recommend_pause": risk["recommend_pause"],
+        "current_streak": risk["current_consecutive_losses"],
+        "max_streak": risk["max_historical_streak"],
+        "threshold": risk["pause_threshold"],
+        "reason": (
+            f"current streak {risk['current_consecutive_losses']} ≥ "
+            f"threshold {risk['pause_threshold']}"
+            if risk["recommend_pause"] else "within normal range"
+        ),
+    }
+
+
 # ============ MCP Tools ============
 
 @mcp.tool()
@@ -634,72 +761,173 @@ def get_trade_history() -> str:
 
 @mcp.tool()
 def calculate_technical_indicators(symbol: str, indicator: str, period: int = 14) -> str:
-    """Calculate technical indicators (sma, rsi) for a symbol"""
+    """Calculate technical indicators for a symbol.
+    Supported: sma, ema, rsi, macd, bb (Bollinger Bands), atr.
+    MACD uses fast=12, slow=26, signal=9 and ignores the period parameter.
+    BB uses period as the window (default 20) with 2-sigma bands.
+    ATR uses period as the smoothing window (default 14).
+    """
     async def _calculate_indicators():
         client = await get_deriv_client()
         try:
-            # Get historical data
-            response = await client.get_ticks_history(symbol, count=100)
+            count = max(100, period * 3)
+            response = await client.get_ticks_history(symbol, count=count)
             if 'error' in response:
                 return f"Error: {response['error']['message']}"
-            
+
             history = response.get('history', {})
-            prices = [float(price) for price in history.get('prices', [])]
-            
-            if len(prices) < period:
-                return f"Not enough data for {indicator} calculation. Need at least {period} data points."
-            
-            if indicator.lower() == 'sma':
-                values = TechnicalIndicators.calculate_sma(prices, period)
-                latest_value = values[-1] if values and values[-1] is not None else "N/A"
-                return f"{indicator.upper()}({period}) for {symbol}: {latest_value}"
-            
-            elif indicator.lower() == 'rsi':
-                values = TechnicalIndicators.calculate_rsi(prices, period)
-                latest_value = values[-1] if values and values[-1] is not None else "N/A"
-                return f"{indicator.upper()}({period}) for {symbol}: {latest_value}"
-            
+            prices = [float(p) for p in history.get('prices', [])]
+
+            ind = indicator.lower()
+
+            if ind == 'sma':
+                if len(prices) < period:
+                    return f"Need at least {period} ticks for SMA({period})."
+                v = TechnicalIndicators.calculate_sma(prices, period)
+                latest = next((x for x in reversed(v) if x is not None), None)
+                return f"SMA({period}) for {symbol}: {latest}"
+
+            elif ind == 'ema':
+                if len(prices) < period:
+                    return f"Need at least {period} ticks for EMA({period})."
+                v = TechnicalIndicators.calculate_ema(prices, period)
+                latest = next((x for x in reversed(v) if x is not None), None)
+                return f"EMA({period}) for {symbol}: {latest}"
+
+            elif ind == 'rsi':
+                if len(prices) < period + 1:
+                    return f"Need at least {period + 1} ticks for RSI({period})."
+                v = TechnicalIndicators.calculate_rsi(prices, period)
+                latest = next((x for x in reversed(v) if x is not None), None)
+                interpretation = (
+                    "overbought (>70)" if latest and latest > 70
+                    else "oversold (<30)" if latest and latest < 30
+                    else "neutral"
+                )
+                return f"RSI({period}) for {symbol}: {latest} [{interpretation}]"
+
+            elif ind == 'macd':
+                if len(prices) < 35:
+                    return f"Need at least 35 ticks for MACD."
+                macd_line, signal_line, histogram = TechnicalIndicators.calculate_macd(prices)
+                m = next((x for x in reversed(macd_line) if x is not None), None)
+                s = next((x for x in reversed(signal_line) if x is not None), None)
+                h = next((x for x in reversed(histogram) if x is not None), None)
+                cross = "bullish cross" if h and h > 0 else "bearish cross" if h and h < 0 else "neutral"
+                return (
+                    f"MACD for {symbol}:\n"
+                    f"  MACD line:  {m}\n"
+                    f"  Signal:     {s}\n"
+                    f"  Histogram:  {h} [{cross}]"
+                )
+
+            elif ind == 'bb':
+                p = period if period != 14 else 20
+                if len(prices) < p:
+                    return f"Need at least {p} ticks for BB({p})."
+                upper, middle, lower = TechnicalIndicators.calculate_bollinger_bands(prices, period=p)
+                u = next((x for x in reversed(upper) if x is not None), None)
+                mid = next((x for x in reversed(middle) if x is not None), None)
+                lo = next((x for x in reversed(lower) if x is not None), None)
+                price_now = prices[-1]
+                position = (
+                    "above upper band" if price_now > u
+                    else "below lower band" if price_now < lo
+                    else "within bands"
+                )
+                return (
+                    f"Bollinger Bands({p}, 2σ) for {symbol}:\n"
+                    f"  Upper:  {u}\n"
+                    f"  Middle: {mid}\n"
+                    f"  Lower:  {lo}\n"
+                    f"  Current price {price_now} is {position}"
+                )
+
+            elif ind == 'atr':
+                if len(prices) < period + 1:
+                    return f"Need at least {period + 1} ticks for ATR({period})."
+                v = TechnicalIndicators.calculate_atr(prices, period)
+                latest = next((x for x in reversed(v) if x is not None), None)
+                return f"ATR({period}) for {symbol}: {latest} (avg tick-to-tick range)"
+
             else:
-                return f"Unsupported indicator: {indicator}. Available: sma, rsi"
-        
+                return (
+                    f"Unsupported indicator '{indicator}'. "
+                    f"Available: sma, ema, rsi, macd, bb, atr"
+                )
         finally:
             pass
-    
+
     return asyncio.run(_calculate_indicators())
 
 @mcp.tool()
 def analyze_portfolio_performance() -> str:
-    """Analyze portfolio performance and provide summary"""
-    async def _analyze_portfolio():
-        user_id = get_user_id()
-        trades = TradingRepository.get_trades_by_user(user_id)
-        portfolio = TradingRepository.get_portfolio(user_id)
-        
-        if not trades:
-            return "No trades available for analysis"
-        
-        total_trades = len(trades)
-        winning_trades = len([t for t in trades if t.profit_loss and t.profit_loss > 0])
-        losing_trades = len([t for t in trades if t.profit_loss and t.profit_loss < 0])
-        
-        total_profit_loss = sum([t.profit_loss for t in trades if t.profit_loss])
-        
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        
-        result = f"Portfolio Performance Analysis:\n"
-        result += f"Total Trades: {total_trades}\n"
-        result += f"Winning Trades: {winning_trades}\n"
-        result += f"Losing Trades: {losing_trades}\n"
-        result += f"Win Rate: {win_rate:.2f}%\n"
-        result += f"Total P&L: ${total_profit_loss:.2f}\n"
-        
-        if portfolio:
-            result += f"Current Balance: ${portfolio.balance}\n"
-            result += f"Current Equity: ${portfolio.equity}\n"
-        
-        return result
-    
-    return asyncio.run(_analyze_portfolio())
+    """Full portfolio performance analysis using Lean-ported statistics.
+    Returns win rate, profit factor, expectancy, Sharpe/Sortino ratios,
+    streak tracking, drawdown, and trade duration breakdown.
+    """
+    user_id = get_user_id()
+    orm_trades = TradingRepository.get_trades_by_user(user_id)
+    portfolio = TradingRepository.get_portfolio(user_id)
+    closed = _orm_to_closed_trades(orm_trades)
+
+    open_count = sum(1 for t in orm_trades if t.status == 'open')
+
+    if not closed:
+        return (
+            f"No closed trades to analyse yet.\n"
+            f"Open trades: {open_count}"
+        )
+
+    s = calculate_trade_stats(closed)
+
+    lines = [
+        "=== Portfolio Performance Analysis ===",
+        "",
+        f"Trades:          {s.total_trades} closed, {open_count} open",
+        f"Wins / Losses:   {s.winning_trades} / {s.losing_trades}",
+        f"Win Rate:        {s.win_rate * 100:.1f}%",
+        f"Loss Rate:       {s.loss_rate * 100:.1f}%",
+        "",
+        f"Total P&L:       ${s.total_profit_loss:.2f}",
+        f"Total Profit:    ${s.total_profit:.2f}",
+        f"Total Loss:      ${s.total_loss:.2f}",
+        f"Largest Win:     ${s.largest_profit:.2f}",
+        f"Largest Loss:    ${s.largest_loss:.2f}",
+        f"Avg P&L/trade:   ${s.average_profit_loss:.2f}",
+        f"Avg Win:         ${s.average_profit:.2f}",
+        f"Avg Loss:        ${s.average_loss:.2f}",
+        "",
+        f"Profit Factor:   {s.profit_factor:.2f}  (>1 = net positive)",
+        f"P&L Ratio:       {s.profit_loss_ratio:.2f}  (avg win / avg loss)",
+        f"Win/Loss Ratio:  {s.win_loss_ratio:.2f}",
+        f"Expectancy:      {s.expectancy:.3f}  (>0 = edge exists)",
+        "",
+        f"Sharpe (trade):  {s.sharpe_ratio:.3f}",
+        f"Sortino (trade): {s.sortino_ratio:.3f}",
+        f"P&L Std Dev:     ${s.profit_loss_std_dev:.2f}",
+        "",
+        f"Max Consec Wins: {s.max_consecutive_wins}",
+        f"Max Consec Loss: {s.max_consecutive_losses}",
+        f"Current Streak:  {s.current_consecutive_losses} consecutive losses",
+        "",
+        f"Max Closed DD:   ${s.max_closed_drawdown:.2f}",
+        f"P&L / Max DD:    {s.profit_to_max_drawdown_ratio:.2f}",
+        "",
+        f"Avg Duration:    {_fmt_duration(s.avg_duration_seconds)} (all) | "
+        f"{_fmt_duration(s.avg_winning_duration_seconds)} (wins) | "
+        f"{_fmt_duration(s.avg_losing_duration_seconds)} (losses)",
+        f"Median Duration: {_fmt_duration(s.median_duration_seconds)}",
+    ]
+
+    if portfolio:
+        lines += [
+            "",
+            f"Balance:         ${portfolio.balance:.2f}",
+            f"Equity:          ${portfolio.equity:.2f}",
+        ]
+
+    return "\n".join(lines)
 
 @mcp.tool()
 def get_active_symbols() -> str:
@@ -727,6 +955,218 @@ def get_active_symbols() -> str:
             pass
     
     return asyncio.run(_get_symbols())
+
+
+@mcp.tool()
+def get_risk_metrics() -> str:
+    """Portfolio-level risk metrics: annualised Sharpe/Sortino, CAGR, max drawdown,
+    and 1-day VaR at 95% and 99% confidence. Uses equity-curve-based calculations
+    ported from Lean's PortfolioStatistics.
+    """
+    user_id = get_user_id()
+    orm_trades = TradingRepository.get_trades_by_user(user_id)
+    portfolio = TradingRepository.get_portfolio(user_id)
+    closed = _orm_to_closed_trades(orm_trades)
+
+    if not closed:
+        return "No closed trades to calculate risk metrics."
+
+    total_pnl = sum(t.profit_loss for t in closed)
+    current_balance = portfolio.balance if portfolio else 0.0
+    starting_equity = max(current_balance - total_pnl, 1.0)
+
+    ps = calculate_portfolio_stats(closed, starting_equity)
+
+    lines = [
+        "=== Risk Metrics (Equity-Curve Based) ===",
+        "",
+        f"Start Equity:    ${ps.start_equity:.2f}",
+        f"End Equity:      ${ps.end_equity:.2f}",
+        f"Net Profit:      {ps.total_net_profit_pct:.2f}%",
+        f"CAGR:            {ps.cagr:.2f}%  (annualised)",
+        "",
+        f"Sharpe Ratio:    {ps.sharpe_ratio:.3f}  (annualised, risk-free=0)",
+        f"Sortino Ratio:   {ps.sortino_ratio:.3f}  (downside deviation only)",
+        "",
+        f"Max Drawdown:    {ps.max_drawdown_pct:.2f}%",
+        f"DD Recovery:     {ps.drawdown_recovery_days} days",
+        "",
+        f"VaR 95%:         {ps.var_95 * 100:.2f}% of equity  (1-day)",
+        f"VaR 99%:         {ps.var_99 * 100:.2f}% of equity  (1-day)",
+        "",
+        "Interpretation:",
+        "  Sharpe > 1.0 = good risk-adjusted return",
+        "  Sharpe > 2.0 = excellent",
+        "  VaR 95% = expected daily loss in worst 5% of days",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_per_symbol_performance() -> str:
+    """Break down performance by volatility symbol.
+    Shows trades, win rate, total P&L, profit factor, trade-level Sharpe,
+    and average trade duration per symbol — sorted by total P&L descending.
+    """
+    user_id = get_user_id()
+    orm_trades = TradingRepository.get_trades_by_user(user_id)
+    closed = _orm_to_closed_trades(orm_trades)
+
+    if not closed:
+        return "No closed trades to analyse by symbol."
+
+    symbol_stats = calculate_per_symbol_stats(closed)
+    symbol_stats.sort(key=lambda x: x.total_profit_loss, reverse=True)
+
+    lines = ["=== Per-Symbol Performance ===", ""]
+    for ss in symbol_stats:
+        s = ss.trade_stats
+        lines.append(f"[{ss.symbol}]")
+        lines.append(
+            f"  Trades: {s.total_trades}  |  Win Rate: {s.win_rate * 100:.1f}%  |  "
+            f"P&L: ${s.total_profit_loss:.2f}"
+        )
+        lines.append(
+            f"  Profit Factor: {s.profit_factor:.2f}  |  "
+            f"Sharpe: {s.sharpe_ratio:.3f}  |  "
+            f"Expectancy: {s.expectancy:.3f}"
+        )
+        lines.append(
+            f"  Avg Duration: {_fmt_duration(s.avg_duration_seconds)}  |  "
+            f"Consec Loss (cur/max): {s.current_consecutive_losses}/{s.max_consecutive_losses}"
+        )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def analyze_trade_quality() -> str:
+    """Analyse trade quality via duration distribution.
+    Breaks trades into quartiles by hold time and shows win rate and P&L per bucket
+    so the agent can identify the optimal hold window.
+    Also shows whether wins tend to be held longer or shorter than losses.
+    """
+    user_id = get_user_id()
+    orm_trades = TradingRepository.get_trades_by_user(user_id)
+    closed = _orm_to_closed_trades(orm_trades)
+
+    if not closed:
+        return "No closed trades to analyse."
+
+    s = calculate_trade_stats(closed)
+    report = duration_quality_report(closed)
+
+    lines = [
+        "=== Trade Quality Analysis ===",
+        "",
+        f"Avg winning trade duration:  {_fmt_duration(s.avg_winning_duration_seconds)}",
+        f"Avg losing trade duration:   {_fmt_duration(s.avg_losing_duration_seconds)}",
+        f"Median trade duration:       {_fmt_duration(s.median_duration_seconds)}",
+        "",
+        "Win rate and P&L by hold-time quartile:",
+    ]
+
+    best_bucket = None
+    best_wr = -1.0
+    for label, stats in report.items():
+        lines.append(
+            f"  {label:>18}  |  {stats['trades']:>3} trades  |  "
+            f"WR {stats['win_rate']:>5.1f}%  |  P&L ${stats['total_pnl']:>8.2f}"
+        )
+        if stats['win_rate'] > best_wr:
+            best_wr = stats['win_rate']
+            best_bucket = label
+
+    lines += [
+        "",
+        f"Best duration bucket: {best_bucket} ({best_wr:.1f}% win rate)",
+        "",
+        "Note: higher win rate in a duration bucket suggests the agent should",
+        "      prefer trades that are held within that time window.",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def analyze_streak_risk() -> str:
+    """Assess current streak risk across all symbols and per symbol.
+    Returns current consecutive loss count vs historical maximum,
+    and a clear pause recommendation when the streak approaches the historical max.
+    """
+    user_id = get_user_id()
+    orm_trades = TradingRepository.get_trades_by_user(user_id)
+    closed = _orm_to_closed_trades(orm_trades)
+
+    if not closed:
+        return "No closed trades to assess streak risk."
+
+    overall = calculate_trade_stats(closed)
+    risk = streak_risk_assessment(overall)
+
+    lines = [
+        "=== Streak Risk Assessment ===",
+        "",
+        f"Current consecutive losses:  {risk['current_consecutive_losses']}",
+        f"Max historical streak:       {risk['max_historical_streak']}",
+        f"% of historical max:         {risk['pct_of_historical_max']:.1f}%",
+        f"Pause threshold:             {risk['pause_threshold']} consecutive losses",
+        f"RECOMMEND PAUSE:             {'YES — stop trading now' if risk['recommend_pause'] else 'No — within normal range'}",
+        "",
+        "Per-symbol streak status:",
+    ]
+
+    symbol_stats = calculate_per_symbol_stats(closed)
+    for ss in symbol_stats:
+        s = ss.trade_stats
+        r = streak_risk_assessment(s)
+        flag = " *** PAUSE ***" if r['recommend_pause'] else ""
+        lines.append(
+            f"  {ss.symbol:<12}  cur={r['current_consecutive_losses']}  "
+            f"max={r['max_historical_streak']}  "
+            f"({r['pct_of_historical_max']:.0f}% of max){flag}"
+        )
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_market_signal(symbol: str) -> str:
+    """Score-based composite BUY/SELL/HOLD call for a symbol.
+    Combines RSI, MACD histogram, and Bollinger-band position.
+    Streak-risk pause override forces HOLD when the portfolio is in a danger streak."""
+    async def _do():
+        client = await get_deriv_client()
+        response = await client.get_ticks_history(symbol, count=200)
+        if 'error' in response:
+            return f"Error: {response['error']['message']}"
+        prices = [float(p) for p in response.get('history', {}).get('prices', [])]
+        sig = _compute_market_signal(symbol, prices)
+        try:
+            user_id = get_user_id()
+            pause = _portfolio_pause_status(user_id)
+        except ValueError:
+            pause = {"recommend_pause": False, "reason": "no user context"}
+
+        if pause["recommend_pause"]:
+            sig["call"] = "HOLD"
+            sig["reason"] = f"streak-risk pause ({pause['reason']})"
+
+        if sig.get("rsi") is None:
+            return f"Signal for {symbol}: HOLD ({sig['reason']})"
+
+        return (
+            f"=== Signal for {symbol} ===\n"
+            f"Price:   {sig['current_price']}\n"
+            f"RSI:     {sig['rsi']['value']:.2f} [{sig['rsi']['label']}]  ({sig['rsi']['score']:+d})\n"
+            f"MACD-h:  {sig['macd']['hist']:+.5f} [{sig['macd']['label']}]  ({sig['macd']['score']:+d})\n"
+            f"BB-pos:  {sig['bb']['position']}  ({sig['bb']['score']:+d})\n"
+            f"Score:   {sig['composite_score']:+d}\n"
+            f"Call:    {sig['call']}\n"
+            f"Why:     {sig['reason']}"
+        )
+    return asyncio.run(_do())
+
 
 # REST API endpoints for n8n integration
 @mcp.custom_route("/api/balance", methods=["GET"])
@@ -1546,6 +1986,57 @@ def api_portfolio_stats(request: StarletteRequest) -> JSONResponse:
     except Exception as e:
         log_error(e, "api_portfolio_stats")
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/signals/{symbol}", methods=["GET"])
+async def api_get_signal(request: StarletteRequest) -> JSONResponse:
+    """Composite BUY/SELL/HOLD signal for a symbol with full sub-indicator breakdown.
+    Honours the portfolio streak-risk pause override."""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
+    try:
+        symbol = request.path_params["symbol"]
+        validated_symbol, err = validate_symbol(symbol)
+        if err:
+            return JSONResponse({"success": False, "error": err}, status_code=400)
+
+        client = await get_deriv_client()
+        response = await client.get_ticks_history(validated_symbol, count=200)
+        if "error" in response:
+            return JSONResponse({"success": False, "error": response["error"]["message"]},
+                                status_code=500)
+        prices = [float(p) for p in response.get("history", {}).get("prices", [])]
+        sig = _compute_market_signal(validated_symbol, prices)
+
+        pause = _portfolio_pause_status(user_id)
+        if pause["recommend_pause"]:
+            sig["call"] = "HOLD"
+            sig["reason"] = f"streak-risk pause ({pause['reason']})"
+        sig["pause_override"] = pause["recommend_pause"]
+        sig["pause"] = pause
+
+        log_api_call(f"/api/signals/{validated_symbol}", "GET", 200)
+        return JSONResponse({"success": True, "signal": sig})
+    except Exception as e:
+        log_error(e, "api_get_signal")
+        return JSONResponse({"success": False, "error": "Failed to compute signal"},
+                            status_code=500)
+
+
+@mcp.custom_route("/api/portfolio/pause-status", methods=["GET"])
+def api_pause_status(request: StarletteRequest) -> JSONResponse:
+    """Portfolio-level streak-risk pause status — drives the dashboard banner."""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
+    try:
+        return JSONResponse({"success": True, "pause": _portfolio_pause_status(user_id)})
+    except Exception as e:
+        log_error(e, "api_pause_status")
+        return JSONResponse({"success": False, "error": "Failed to fetch pause status"},
+                            status_code=500)
+
 
 if __name__ == "__main__":
     import signal

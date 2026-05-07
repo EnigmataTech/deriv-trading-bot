@@ -218,6 +218,28 @@ class DerivTradingApp(App):
     /* ── Open trades ───────────────────────── */
     #open-trades-table { height: 12; }
 
+    /* ── Signals ───────────────────────────── */
+    #signals-table { height: 9; }
+
+    /* ── Pause banner ──────────────────────── */
+    #pause-banner {
+        height: 3;
+        padding: 0 1;
+        margin: 0 1 1 0;
+        border: solid $primary;
+        color: $text-muted;
+    }
+    #pause-banner.pause-active {
+        border: solid red;
+        background: $error 20%;
+        color: red;
+        text-style: bold;
+    }
+    #pause-banner.pause-clear {
+        border: solid $success;
+        color: $success;
+    }
+
     /* ── Agent activity ────────────────────── */
     #agent-log { height: 1fr; min-height: 5; }
 
@@ -300,6 +322,8 @@ class DerivTradingApp(App):
         self._mkt_col_price: Any = None
         self._mkt_col_change: Any = None
         self._mkt_row_keys: dict[str, Any] = {}   # symbol → RowKey
+        self._sig_row_keys: dict[str, Any] = {}   # symbol → RowKey for signals-table
+        self._timer_signals: Optional[Timer] = None
 
     # ─── Layout ──────────────────────────────────────────────────────────────
 
@@ -313,6 +337,7 @@ class DerivTradingApp(App):
                     yield Static("Connecting...", id="account-panel", classes="panel")
                     yield Static("",              id="portfolio-panel", classes="panel")
                     yield Static("",              id="status-panel",   classes="panel")
+                yield Static("Pause status: loading…", id="pause-banner")
                 with Horizontal(id="main-split"):
                     with Vertical(id="left-col"):
                         yield DataTable(id="market-table", classes="panel", cursor_type="row")
@@ -329,6 +354,7 @@ class DerivTradingApp(App):
                                     )
                     with Vertical(id="right-col"):
                         yield DataTable(id="open-trades-table", classes="panel", cursor_type="row")
+                        yield DataTable(id="signals-table", classes="panel", cursor_type="row")
                         yield RichLog(id="agent-log", markup=True, classes="panel")
                 yield RichLog(id="activity-log", classes="panel", markup=True)
 
@@ -425,11 +451,17 @@ class DerivTradingApp(App):
         mt.border_title = "Market Watch"
 
         ot = self.query_one("#open-trades-table", DataTable)
-        ot.add_columns("#ID", "Symbol", "Dir", "Stake", "Entry", "Current", "P&L")
+        ot.add_columns("ID", "Symbol", "Dir", "Stake", "Current", "P&L")
         ot.border_title = "Open Positions"
 
+        st = self.query_one("#signals-table", DataTable)
+        st.add_columns("Symbol", "Price", "RSI", "MACD", "BB", "Score", "Call", "Why")
+        st.border_title = "Signals  (RSI / MACD / BB → composite)"
+
+        self.query_one("#pause-banner", Static).border_title = "Streak-Risk Pause"
+
         ht = self.query_one("#history-table", DataTable)
-        ht.add_columns("#ID", "Symbol", "Dir", "Stake", "Entry", "Exit", "P&L", "Closed")
+        ht.add_columns("ID", "Symbol", "Dir", "Stake", "Entry", "Exit", "P&L", "Closed")
         ht.border_title = "Trade History"
 
         self.query_one("#sparkline-panel").border_title = "Sparklines  (1m)"
@@ -464,6 +496,7 @@ class DerivTradingApp(App):
         await self._fetch_market_data()
         await self._fetch_agent_activity()
         await self._fetch_history()
+        await self._fetch_signals()
 
         self._timer_ticks   = self.set_interval(1,  self.refresh_ticks)
         self._timer_balance = self.set_interval(30, self.refresh_balance)
@@ -471,6 +504,7 @@ class DerivTradingApp(App):
         self._timer_market  = self.set_interval(5, self.refresh_market_data)
         self._timer_history = self.set_interval(15, self.refresh_history)
         self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
+        self._timer_signals = self.set_interval(10, self.refresh_signals)
 
     # ─── Data fetchers ────────────────────────────────────────────────────────
 
@@ -551,11 +585,12 @@ class DerivTradingApp(App):
             if self._modal_open:
                 return
             table = self.query_one("#open-trades-table", DataTable)
+            scroll_x = table.scroll_x  # preserve horizontal scroll position
             table.clear()
             self._open_trade_rows.clear()
 
             if not trades:
-                table.add_row("—", "No open trades", "—", "—", "—", "—", "—", key="empty")
+                table.add_row("—", "No open trades", "—", "—", "—", "—", key="empty")
             else:
                 for t in trades:
                     pnl = t.get("unrealized_pnl")
@@ -566,22 +601,27 @@ class DerivTradingApp(App):
 
                     direction = t.get("type", "").upper()
                     dir_text = (
-                        Text("▲ CALL", style="bold green") if direction == "CALL"
-                        else Text("▼ PUT", style="bold red")
+                        Text("▲ BUY",  style="bold green") if direction in ("MULTUP",  "CALL")
+                        else Text("▼ SELL", style="bold red")
                     )
                     symbol = t.get("symbol", "")
-                    row_key = str(t.get("trade_id", t.get("id", "")))
+                    trade_id = str(t.get("trade_id", t.get("id", "")))
+                    short_id = f"…{trade_id[-6:]}"
+                    current = t.get("current_price", 0)
+
                     table.add_row(
-                        row_key,
-                        f"{symbol} ({get_short_name(symbol)})",
+                        short_id,
+                        symbol,
                         dir_text,
                         f"${t.get('amount', 0):.2f}",
-                        f"{t.get('entry_price', 0):.5f}",
-                        f"{t.get('current_price', 0):.5f}" if t.get("current_price") else "—",
+                        f"{current:.2f}" if current else "—",
                         pnl_text,
-                        key=row_key,
+                        key=trade_id,
                     )
-                    self._open_trade_rows[row_key] = t
+                    self._open_trade_rows[trade_id] = t
+
+            # Restore scroll position after redraw
+            self.call_after_refresh(lambda: table.scroll_to(scroll_x, 0, animate=False))
 
             # Update portfolio panel
             stats_resp = await api_get("/api/trades/summary")
@@ -715,19 +755,28 @@ class DerivTradingApp(App):
                 ) if pnl is not None else Text("—")
                 direction = t.get("type", t.get("trade_type", "")).upper()
                 dir_text = (
-                    Text("▲ CALL", style="bold green") if direction == "CALL"
-                    else Text("▼ PUT", style="bold red")
+                    Text("▲ BUY",  style="bold green") if direction in ("MULTUP", "CALL")
+                    else Text("▼ SELL", style="bold red")
                 )
                 symbol = t.get("symbol", "")
+                trade_id = str(t.get("trade_id", t.get("id", "")))
                 closed = t.get("closed_at", "")
                 closed_short = closed[:16].replace("T", " ") if closed else "—"
+
+                exit_price = t.get("exit_price") or 0
+                # exit_price is a real spot price only when >10; smaller values are payouts, not prices
+                exit_str = f"{exit_price:.2f}" if exit_price and exit_price > 0.01 else "—"
+
+                entry = t.get("entry_price") or 0
+                entry_str = f"{entry:.2f}" if entry > 0.01 else "—"
+
                 table.add_row(
-                    str(t.get("trade_id", t.get("id", ""))),
-                    f"{symbol} ({get_short_name(symbol)})",
+                    f"…{trade_id[-6:]}",
+                    symbol,
                     dir_text,
                     f"${t.get('amount', 0):.2f}",
-                    f"{t.get('entry_price', 0):.5f}",
-                    f"{t.get('exit_price', 0):.5f}" if t.get("exit_price") else "—",
+                    entry_str,
+                    exit_str,
                     pnl_text,
                     closed_short,
                 )
@@ -781,6 +830,91 @@ class DerivTradingApp(App):
     @work(exclusive=True)
     async def refresh_agent_activity(self) -> None:
         await self._fetch_agent_activity()
+
+    async def _fetch_signals(self) -> None:
+        """Pull pause-status and per-symbol signals; update banner + table."""
+        try:
+            pause_resp = await api_get("/api/portfolio/pause-status")
+            if pause_resp.get("success"):
+                p = pause_resp.get("pause", {})
+                banner = self.query_one("#pause-banner", Static)
+                banner.remove_class("pause-active")
+                banner.remove_class("pause-clear")
+                if p.get("recommend_pause"):
+                    banner.add_class("pause-active")
+                    banner.update(
+                        f"⚠  PAUSE RECOMMENDED — {p.get('current_streak', 0)} consecutive losses "
+                        f"(threshold {p.get('threshold', 0)}, max ever {p.get('max_streak', 0)})"
+                    )
+                else:
+                    banner.add_class("pause-clear")
+                    banner.update(
+                        f"✓ Streak OK — current {p.get('current_streak', 0)} / "
+                        f"threshold {p.get('threshold', 0)} / max {p.get('max_streak', 0)}"
+                    )
+        except Exception as e:
+            self._log(f"[yellow]pause-status fetch error: {e}[/yellow]")
+
+        rows: list[tuple] = []
+        for sym in DEFAULT_SYMBOLS:
+            try:
+                resp = await api_get(f"/api/signals/{sym}")
+                if not resp.get("success"):
+                    continue
+                sig = resp.get("signal", {})
+                rows.append((sym, sig))
+            except Exception as e:
+                self._log(f"[yellow]signal {sym} error: {e}[/yellow]")
+
+        if not rows:
+            return
+
+        try:
+            table = self.query_one("#signals-table", DataTable)
+            table.clear()
+            self._sig_row_keys.clear()
+            for sym, sig in rows:
+                price = sig.get("current_price")
+                rsi = sig.get("rsi") or {}
+                macd = sig.get("macd") or {}
+                bb = sig.get("bb") or {}
+                call = sig.get("call", "HOLD")
+                score = sig.get("composite_score", 0)
+                why = sig.get("reason", "")
+
+                price_text = f"{price:.5f}" if isinstance(price, (int, float)) else "—"
+                rsi_v = rsi.get("value")
+                rsi_text = (
+                    f"{rsi_v:.1f} {rsi.get('label', '')}".strip()
+                    if isinstance(rsi_v, (int, float)) else "—"
+                )
+                macd_h = macd.get("hist")
+                macd_text = (
+                    f"{macd_h:+.4f} {macd.get('label', '')}".strip()
+                    if isinstance(macd_h, (int, float)) else "—"
+                )
+                bb_text = bb.get("position", "—")
+                score_text = f"{score:+d}"
+
+                if call == "BUY":
+                    call_text = Text("▲ BUY", style="bold green")
+                elif call == "SELL":
+                    call_text = Text("▼ SELL", style="bold red")
+                else:
+                    call_text = Text("HOLD", style="dim")
+
+                rk = table.add_row(
+                    sym, price_text, rsi_text, macd_text, bb_text,
+                    score_text, call_text, why,
+                    key=sym,
+                )
+                self._sig_row_keys[sym] = rk
+        except Exception as e:
+            self._log(f"[red]Signals table update error: {e}[/red]")
+
+    @work(exclusive=True)
+    async def refresh_signals(self) -> None:
+        await self._fetch_signals()
 
     async def _close_trade(self, trade_id: str) -> None:
         """Close an open multiplier position."""
