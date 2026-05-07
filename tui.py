@@ -211,9 +211,9 @@ class DerivTradingApp(App):
 
     /* ── Sparklines ────────────────────────── */
     #sparkline-panel  { height: auto; }
-    .sparkline-row    { height: 4; margin-bottom: 1; }
-    .sparkline-label  { width: 10; color: $text-muted; padding-top: 1; }
-    .sparkline-widget { width: 1fr; height: 4; }
+    .sparkline-row    { height: 3; }
+    .sparkline-label  { width: 10; color: $text-muted; }
+    .sparkline-widget { width: 1fr; height: 3; }
 
     /* ── Open trades ───────────────────────── */
     #open-trades-table { height: 12; }
@@ -223,20 +223,16 @@ class DerivTradingApp(App):
 
     /* ── Pause banner ──────────────────────── */
     #pause-banner {
-        height: 3;
+        height: 1;
         padding: 0 1;
-        margin: 0 1 1 0;
-        border: solid $primary;
         color: $text-muted;
     }
     #pause-banner.pause-active {
-        border: solid red;
-        background: $error 20%;
+        background: $error 30%;
         color: red;
         text-style: bold;
     }
     #pause-banner.pause-clear {
-        border: solid $success;
         color: $success;
     }
 
@@ -457,8 +453,6 @@ class DerivTradingApp(App):
         st = self.query_one("#signals-table", DataTable)
         st.add_columns("Symbol", "Price", "RSI", "MACD", "BB", "Score", "Call", "Why")
         st.border_title = "Signals  (RSI / MACD / BB → composite)"
-
-        self.query_one("#pause-banner", Static).border_title = "Streak-Risk Pause"
 
         ht = self.query_one("#history-table", DataTable)
         ht.add_columns("ID", "Symbol", "Dir", "Stake", "Entry", "Exit", "P&L", "Closed")
@@ -832,45 +826,51 @@ class DerivTradingApp(App):
         await self._fetch_agent_activity()
 
     async def _fetch_signals(self) -> None:
-        """Pull pause-status and per-symbol signals; update banner + table."""
-        try:
-            pause_resp = await api_get("/api/portfolio/pause-status")
-            if pause_resp.get("success"):
-                p = pause_resp.get("pause", {})
-                banner = self.query_one("#pause-banner", Static)
-                banner.remove_class("pause-active")
-                banner.remove_class("pause-clear")
-                if p.get("recommend_pause"):
-                    banner.add_class("pause-active")
-                    banner.update(
-                        f"⚠  PAUSE RECOMMENDED — {p.get('current_streak', 0)} consecutive losses "
-                        f"(threshold {p.get('threshold', 0)}, max ever {p.get('max_streak', 0)})"
-                    )
-                else:
-                    banner.add_class("pause-clear")
-                    banner.update(
-                        f"✓ Streak OK — current {p.get('current_streak', 0)} / "
-                        f"threshold {p.get('threshold', 0)} / max {p.get('max_streak', 0)}"
-                    )
-        except Exception as e:
-            self._log(f"[yellow]pause-status fetch error: {e}[/yellow]")
+        """Pull pause-status and per-symbol signals in parallel; update banner + table."""
+        results = await asyncio.gather(
+            api_get("/api/portfolio/pause-status"),
+            *(api_get(f"/api/signals/{sym}") for sym in DEFAULT_SYMBOLS),
+            return_exceptions=True,
+        )
+        pause_resp = results[0]
+        signal_results = results[1:]
+
+        if isinstance(pause_resp, Exception):
+            self._log(f"[yellow]pause-status fetch error: {pause_resp}[/yellow]")
+        elif pause_resp.get("success"):
+            p = pause_resp.get("pause", {})
+            banner = self.query_one("#pause-banner", Static)
+            banner.remove_class("pause-active")
+            banner.remove_class("pause-clear")
+            if p.get("recommend_pause"):
+                banner.add_class("pause-active")
+                banner.update(
+                    f"⚠  PAUSE RECOMMENDED — {p.get('current_streak', 0)} consecutive losses "
+                    f"(threshold {p.get('threshold', 0)}, max ever {p.get('max_streak', 0)})"
+                )
+            else:
+                banner.add_class("pause-clear")
+                banner.update(
+                    f"✓ Streak OK — current {p.get('current_streak', 0)} / "
+                    f"threshold {p.get('threshold', 0)} / max {p.get('max_streak', 0)}"
+                )
 
         rows: list[tuple] = []
-        for sym in DEFAULT_SYMBOLS:
-            try:
-                resp = await api_get(f"/api/signals/{sym}")
-                if not resp.get("success"):
-                    continue
-                sig = resp.get("signal", {})
-                rows.append((sym, sig))
-            except Exception as e:
-                self._log(f"[yellow]signal {sym} error: {e}[/yellow]")
+        for sym, resp in zip(DEFAULT_SYMBOLS, signal_results):
+            if isinstance(resp, Exception):
+                self._log(f"[yellow]signal {sym} error: {resp}[/yellow]")
+                continue
+            if not resp.get("success"):
+                continue
+            rows.append((sym, resp.get("signal", {})))
 
         if not rows:
             return
 
         try:
             table = self.query_one("#signals-table", DataTable)
+            ts = datetime.now().strftime("%H:%M:%S")
+            table.border_title = f"Signals  (RSI / MACD / BB → composite)  · updated {ts}"
             table.clear()
             self._sig_row_keys.clear()
             for sym, sig in rows:
