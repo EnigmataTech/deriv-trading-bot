@@ -19,7 +19,8 @@ A terminal-based binary options trading bot for the [Deriv](https://deriv.com) p
 │              deriv_client.py                        │
 │  WebSocket ↔ wss://ws.binaryws.com/websockets/v3   │
 │  get_ticks_history · place_contract · sell_contract │
-│  TechnicalIndicators: SMA · RSI                     │
+│  TechnicalIndicators: SMA · RSI · MACD · Bollinger  │
+│  DerivTickStream — persistent subscription cache    │
 └────────────────────┬────────────────────────────────┘
                      │
        ┌─────────────┴─────────────┐
@@ -46,10 +47,13 @@ A terminal-based binary options trading bot for the [Deriv](https://deriv.com) p
 |------|---------|
 | `tui.py` | Textual TUI dashboard — main interactive interface |
 | `main.py` | FastMCP HTTP server with REST API for n8n/AI agents |
-| `deriv_client.py` | Async WebSocket client for the Deriv API + technical indicators |
+| `deriv_client.py` | Async WebSocket client for the Deriv API + technical indicators + tick stream |
 | `database.py` | SQLAlchemy ORM models (`Trade`, `Portfolio`) + `TradingRepository` |
-| `trade_monitor.py` | Background service polling contract settlements, executing stops |
+| `trade_monitor.py` | Background poller — settlement, SL/TP/trailing stops, price reconciliation |
+| `analytics.py` | Lean-ported analytics engine: trade stats, streak-risk, P&L history |
+| `symbols.py` | Symbol whitelist + multiplier validation tables |
 | `logger.py` | Structured logging setup with audit trail helpers |
+| `test_signals.py`, `test_analytics.py`, `test_mcp_tools.py` | Unit tests |
 
 ---
 
@@ -87,7 +91,13 @@ PORT=8000
 
 ### 3. Database
 
-The SQLite database is created automatically on first run at the path set by `DATABASE_URL` (default: `sqlite:////app/data/trading_database.db`). Schema migrations run on startup.
+PostgreSQL is the production datastore. Set `DATABASE_URL` to a Postgres DSN, e.g.:
+
+```env
+DATABASE_URL=postgresql://user:password@host:5432/trading
+```
+
+Default if unset: `postgresql://postgres:postgres@localhost:5432/trading`. Schema migrations run on startup (additive — adds new columns to existing tables without data loss).
 
 ---
 
@@ -137,6 +147,15 @@ python trade_monitor.py --interval 30
 │ │ R_50    ▁▂▃▄▅▆▇█▇▆▅▄▃▂▃▄▅▆▇                           │ │
 │ │ R_100   ▂▃▄▃▂▃▄▅▆▇▆▅▄▃▂▁▂▃▄                           │ │
 │ │ 1HZ50V  ▅▄▃▂▃▄▅▆▅▄▃▄▅▆▇▆▅▄▃                           │ │
+│ └───────────────────────────────────────────────────────┘ │
+│                                                             │
+│ ┌─ Pause banner ─ ✓ Streak OK / ⚠ PAUSE RECOMMENDED ─────┐ │
+│ │ ✓ Streak OK — current 0 / threshold 3 / max 1          │ │
+│ └───────────────────────────────────────────────────────┘ │
+│                                                             │
+│ ┌─ SIGNALS  (RSI / MACD / BB → composite) ───────────────┐ │
+│ │ Symbol  Price    RSI    MACD     BB        Call Score │ │
+│ │ R_50    89.4382  30.09  bearish  within    HOLD  -1   │ │
 │ └───────────────────────────────────────────────────────┘ │
 │                                                             │
 │ ┌─ OPEN TRADES  (Enter for detail) ─────────────────────┐  │
@@ -228,17 +247,27 @@ Press `Enter` or `Escape` to close.
 
 **Sparklines:** Last 20 tick prices per watched symbol. Green = max value, red = min value.
 
+**Signals panel:** Composite BUY/SELL/HOLD per symbol. Score is `rsi + macd + bb` (each ∈ {-1, 0, +1}); call is `BUY` for ≥+2, `SELL` for ≤-2, else `HOLD`. Per-indicator cells colored by directional bias (green = bullish, red = bearish, dim = neutral). Call cell colored by signal direction.
+
+**Pause banner:** Streak-risk override above the signals table. Shows `✓ Streak OK` (dim green) or `⚠ PAUSE RECOMMENDED` (red) when the user's current consecutive losing streak hits the threshold. When active, all signal calls are forced to `HOLD`.
+
 **Connection status panel:** Shows `● LIVE` (green) when API is reachable or `● DISCONNECTED` (red) on failure. Subtitle bar shows `● LIVE | N open | AUTO | HH:MM:SS`.
 
 ### Auto-Refresh Intervals
 
 | Data | Interval |
 |------|---------|
+| Live ticks (sparklines + market table prices) | 1 s |
+| Open trades | 3 s |
+| Signals + pause banner | 3 s |
+| Market indicators (RSI/SMA cells) | 5 s |
+| Agent activity | 5 s |
+| Trade history | 15 s |
 | Balance / connection status | 30 s |
-| Open trades + portfolio stats | 10 s |
-| Market data + sparklines | 5 s |
 
-Press `a` to pause all three timers simultaneously. Press `a` again to resume.
+Server-side, signals are cached per-symbol with a 3 s TTL so multiple clients (or the agent) hitting `/api/signals` within the window share one Deriv WebSocket round-trip. The TUI fetches all signals in a single batch call.
+
+Press `a` to toggle auto-refresh on/off.
 
 ---
 
@@ -263,6 +292,7 @@ Set `AUTH_ENABLED=false` in `.env` to disable auth for local testing.
 | `GET` | `/health` | Liveness check (no auth) |
 | `GET` | `/api/health` | Health check (no auth) |
 | `GET` | `/api/balance` | Account balance |
+| `GET` | `/api/prices` | Cached live tick prices for the streaming symbols |
 | `GET` | `/api/market-data/{symbol}` | Current tick for symbol |
 | `GET` | `/api/candles/{symbol}?timeframe=1m&count=50` | OHLC candles (1m/5m/15m/1h) |
 | `POST` | `/api/trade` | Place a trade |
@@ -273,9 +303,13 @@ Set `AUTH_ENABLED=false` in `.env` to disable auth for local testing.
 | `POST` | `/api/trades/sync` | Manually sync trade statuses |
 | `POST` | `/api/trades/check` | Trigger trade monitor check |
 | `GET` | `/api/trades/summary` | Aggregated stats |
+| `GET` | `/api/trades/agent` | Agent-driven trade activity feed |
 | `GET` | `/api/indicators/{symbol}?indicator=rsi&period=14` | SMA or RSI |
+| `GET` | `/api/signals/{symbol}` | Composite BUY/SELL/HOLD signal (RSI/MACD/BB) for one symbol |
+| `GET` | `/api/signals?symbols=R_50,R_75,...` | Batch composite signals — all symbols in one call (3 s TTL cache) |
 | `GET` | `/api/portfolio` | Portfolio analysis (text) |
 | `GET` | `/api/portfolio/stats` | Portfolio stats + P&L history (JSON) |
+| `GET` | `/api/portfolio/pause-status` | Streak-risk pause recommendation for the dashboard banner |
 | `GET` | `/api/symbols` | Active trading symbols |
 | `GET` | `/api/trade-monitor/status` | Trade monitor running state |
 | `POST` | `/api/create-test-token` | Get a test JWT |
@@ -314,33 +348,40 @@ Allowed symbols: `R_10`, `R_25`, `R_50`, `R_75`, `R_100`, `1HZ10V`–`1HZ100V`, 
 
 ## Trade Monitor
 
-`TradeMonitor` runs as a background service (inside the TUI and optionally in the API server). Every `poll_interval` seconds it:
+`TradeMonitor` runs as a background service inside the API server. Every `poll_interval` seconds (default 30 s) it:
 
 1. Fetches the Deriv portfolio and profit table
 2. Marks settled contracts as `closed` in the database
 3. Checks all trades with active SL/TP/trailing stops against current prices
 4. Executes sells when a stop level is triggered
+5. **Reconciles missing prices** — any row with `entry_price=0` or (closed AND `exit_price=0`) is backfilled from `proposal_open_contract`. Idempotent; safe to run repeatedly.
 
 Trailing stops move automatically as price moves in the favorable direction.
+
+### `exit_price` semantics
+
+`exit_price` always stores the **spot price** of the underlying at close (matching `entry_price`), never the USD payout. If the close path can only resolve a USD value (e.g. the profit_table sweep), `exit_price` is left at `0` and the reconciliation pass fills it in from contract status on the next poll.
 
 ---
 
 ## Database Schema
 
+PostgreSQL.
+
 ```sql
 CREATE TABLE trades (
-    id                      INTEGER PRIMARY KEY,
+    id                      SERIAL PRIMARY KEY,
     user_id                 VARCHAR NOT NULL,
     trade_id                VARCHAR NOT NULL UNIQUE,  -- Deriv contract ID
     symbol                  VARCHAR NOT NULL,
-    trade_type              VARCHAR NOT NULL,          -- 'call' or 'put'
+    trade_type              VARCHAR NOT NULL,          -- 'call' | 'put' | 'multup' | 'multdown'
     amount                  FLOAT NOT NULL,
-    entry_price             FLOAT NOT NULL,
-    exit_price              FLOAT,
+    entry_price             FLOAT NOT NULL,            -- spot price at entry
+    exit_price              FLOAT,                     -- spot price at exit (NOT USD payout)
     profit_loss             FLOAT,
     status                  VARCHAR NOT NULL DEFAULT 'open',  -- 'open' | 'closed'
-    created_at              DATETIME,
-    closed_at               DATETIME,
+    created_at              TIMESTAMP,
+    closed_at               TIMESTAMP,
     stop_loss               FLOAT,
     take_profit             FLOAT,
     trailing_stop_distance  FLOAT,
@@ -349,13 +390,13 @@ CREATE TABLE trades (
 );
 
 CREATE TABLE portfolios (
-    id           INTEGER PRIMARY KEY,
+    id           SERIAL PRIMARY KEY,
     user_id      VARCHAR NOT NULL,
     balance      FLOAT NOT NULL DEFAULT 0.0,
     equity       FLOAT NOT NULL DEFAULT 0.0,
     margin       FLOAT NOT NULL DEFAULT 0.0,
     free_margin  FLOAT NOT NULL DEFAULT 0.0,
-    updated_at   DATETIME
+    updated_at   TIMESTAMP
 );
 ```
 
@@ -366,6 +407,18 @@ CREATE TABLE portfolios (
 ```bash
 docker build -t deriv-trading-bot .
 docker run -p 8000:8000 --env-file .env deriv-trading-bot
+```
+
+## Kubernetes / GitOps
+
+The production deployment runs on a k3s cluster managed by Flux. Manifests live in the
+`EnigmataTech/k3s_cluster_homelab` repo under `apps/deriv-trading-bot/`. The image
+`enigmata/deriv-trading-bot:latest` on Docker Hub is the source. Roll a new build with:
+
+```bash
+docker build -t enigmata/deriv-trading-bot:latest .
+docker push enigmata/deriv-trading-bot:latest
+kubectl rollout restart deploy/deriv-trading-bot -n deriv-trading-bot
 ```
 
 ---
