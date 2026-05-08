@@ -12,6 +12,8 @@ from typing import Dict, Any, List, Optional, Set
 from contextlib import asynccontextmanager
 from websockets.protocol import State
 
+from sqlalchemy import or_, and_
+
 from deriv_client import DerivAPIClient
 from database import Trade, SessionLocal, TradingRepository
 
@@ -163,6 +165,8 @@ class TradeMonitor:
                 await self.check_open_trades()
                 # Also check stop levels for trades with SL/TP settings
                 await self.check_stop_levels()
+                # Backfill any rows missing entry/exit spot prices from Deriv
+                await self.reconcile_missing_prices()
             except Exception as e:
                 logger.error("Error in polling loop: %s", e)
 
@@ -407,6 +411,68 @@ class TradeMonitor:
         finally:
             db.close()
 
+    async def reconcile_missing_prices(self) -> Dict[str, int]:
+        """Find trades with missing/zero entry_price (any status) or missing/zero
+        exit_price (closed only), and backfill them from Deriv contract status.
+        Idempotent — safe to call repeatedly."""
+        db = SessionLocal()
+        try:
+            bad = db.query(Trade).filter(
+                or_(
+                    Trade.entry_price == 0,
+                    Trade.entry_price.is_(None),
+                    and_(
+                        Trade.status == "closed",
+                        or_(Trade.exit_price == 0, Trade.exit_price.is_(None)),
+                    ),
+                )
+            ).all()
+        finally:
+            db.close()
+
+        result = {"checked": len(bad), "fixed": 0, "errors": 0}
+        if not bad:
+            return result
+
+        for t in bad:
+            try:
+                resp = await self.deriv_client.get_contract_status(str(t.trade_id))
+                poc = (resp or {}).get("proposal_open_contract", {}) or {}
+                entry = poc.get("entry_spot") or poc.get("entry_tick")
+                exit_p = poc.get("exit_tick")
+                profit = poc.get("profit")
+
+                async with self._update_trade_lock:
+                    db = SessionLocal()
+                    try:
+                        row = db.query(Trade).filter(Trade.id == t.id).first()
+                        if not row:
+                            continue
+                        changed = False
+                        if entry and (not row.entry_price or row.entry_price == 0):
+                            row.entry_price = float(entry)
+                            changed = True
+                        if exit_p and (not row.exit_price or row.exit_price == 0):
+                            row.exit_price = float(exit_p)
+                            changed = True
+                        if profit is not None and row.profit_loss is None:
+                            row.profit_loss = float(profit)
+                            changed = True
+                        if changed:
+                            db.commit()
+                            result["fixed"] += 1
+                            logger.info("Reconciled trade %s", t.trade_id)
+                    finally:
+                        db.close()
+            except Exception as e:
+                result["errors"] += 1
+                logger.warning("Reconcile failed for %s: %s", t.trade_id, e)
+
+        if result["fixed"]:
+            logger.info("Price reconciliation: %d/%d fixed (%d errors)",
+                        result["fixed"], result["checked"], result["errors"])
+        return result
+
     async def _fetch_with_retry(
         self,
         fetch_func,
@@ -529,11 +595,13 @@ class TradeMonitor:
         Returns:
             Dict with exit_price, profit_loss, closed_at.
         """
-        # Extract profit/loss
+        # Extract profit/loss (USD) — sell_price/buy_price are USD amounts.
         profit_loss = contract_data.get("sell_price", 0) - contract_data.get("buy_price", 0)
 
-        # Extract sell price as exit price
-        exit_price = contract_data.get("sell_price", 0)
+        # exit_price must be a SPOT price (matching entry_price). The profit_table
+        # only carries USD sell_price, not spot. Leave 0 here; the reconciliation
+        # sweep will fill exit_tick from proposal_open_contract on the next pass.
+        exit_price = 0.0
 
         # Extract sell time as closed_at
         sell_time = contract_data.get("sell_time")
@@ -776,10 +844,20 @@ class TradeMonitor:
             sold_for = float(sell_data.get('sold_for', 0))
             profit_loss = sold_for - trade.amount
 
+            # Pull spot exit_tick (not the USD sold_for) so exit_price is consistent
+            # with entry_price across all close paths.
+            spot_exit_price = 0.0
+            try:
+                status_resp = await self.deriv_client.get_contract_status(str(trade.trade_id))
+                poc = status_resp.get('proposal_open_contract', {}) or {}
+                spot_exit_price = float(poc.get('exit_tick') or poc.get('current_spot') or 0)
+            except Exception:
+                pass
+
             # Update trade in database
             TradingRepository.update_trade_result(
                 trade_id=trade.trade_id,
-                exit_price=sold_for,
+                exit_price=spot_exit_price,
                 profit_loss=profit_loss,
                 status='closed'
             )

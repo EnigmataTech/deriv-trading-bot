@@ -555,6 +555,12 @@ async def _do_place_trade_async(
                 except Exception:
                     pass
 
+            if entry_price == 0:
+                logger.warning(
+                    "Trade %s placed without resolvable entry_price — reconcile sweep will backfill",
+                    contract_id,
+                )
+
             # Store trade in database with SL/TP settings
             TradingRepository.create_trade_with_sl_tp(
                 user_id=user_id,
@@ -623,6 +629,30 @@ def _orm_to_closed_trades(trades) -> list:
             closed_at=t.closed_at,
         ))
     return result
+
+
+_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
+_SIGNAL_CACHE_TTL = 3.0  # seconds
+
+
+async def _get_signal_cached(symbol: str) -> dict:
+    """Fetch ticks history and compute signal with a per-symbol TTL cache.
+    Reduces redundant Deriv WS round-trips when multiple clients (or a batch
+    endpoint) ask for the same symbol within the TTL window."""
+    import time
+    now = time.monotonic()
+    cached = _SIGNAL_CACHE.get(symbol)
+    if cached and (now - cached[0]) < _SIGNAL_CACHE_TTL:
+        return cached[1]
+
+    client = await get_deriv_client()
+    response = await client.get_ticks_history(symbol, count=200)
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "ticks history failed"))
+    prices = [float(p) for p in response.get("history", {}).get("prices", [])]
+    sig = _compute_market_signal(symbol, prices)
+    _SIGNAL_CACHE[symbol] = (now, sig)
+    return sig
 
 
 def _compute_market_signal(symbol: str, prices: list) -> dict:
@@ -1350,6 +1380,20 @@ async def _do_place_multiplier_async(
     except Exception:
         pass
 
+    if entry_price == 0:
+        try:
+            status_resp = await client.get_contract_status(str(contract_id))
+            poc = status_resp.get("proposal_open_contract", {})
+            entry_price = float(poc.get("entry_spot") or poc.get("entry_tick") or 0)
+        except Exception:
+            pass
+
+    if entry_price == 0:
+        logger.warning(
+            "Multiplier trade %s placed without resolvable entry_price — reconcile sweep will backfill",
+            contract_id,
+        )
+
     buy_price = float(buy_data.get("buy_price", amount))
     TradingRepository.create_trade_with_sl_tp(
         user_id=user_id, trade_id=str(contract_id), symbol=symbol,
@@ -1494,10 +1538,20 @@ async def api_sell_contract(request: StarletteRequest) -> JSONResponse:
             sold_for = float(sell_data.get('sold_for', 0))
             profit_loss = float(sell_data.get('profit', sold_for - trade.amount))
 
+            # Pull the spot exit_tick (not the USD payout) so exit_price stays
+            # consistent with entry_price across all close paths.
+            spot_exit_price = 0.0
+            try:
+                status_resp = await client.get_contract_status(contract_id)
+                poc = status_resp.get('proposal_open_contract', {}) or {}
+                spot_exit_price = float(poc.get('exit_tick') or poc.get('current_spot') or 0)
+            except Exception:
+                pass
+
             # Update trade in database
             TradingRepository.update_trade_result(
                 trade_id=contract_id,
-                exit_price=float(sold_for),
+                exit_price=spot_exit_price,
                 profit_loss=profit_loss,
                 status='closed'
             )
@@ -2001,18 +2055,14 @@ async def api_get_signal(request: StarletteRequest) -> JSONResponse:
         if err:
             return JSONResponse({"success": False, "error": err}, status_code=400)
 
-        client = await get_deriv_client()
-        response = await client.get_ticks_history(validated_symbol, count=200)
-        if "error" in response:
-            return JSONResponse({"success": False, "error": response["error"]["message"]},
-                                status_code=500)
-        prices = [float(p) for p in response.get("history", {}).get("prices", [])]
-        sig = _compute_market_signal(validated_symbol, prices)
+        try:
+            sig = await _get_signal_cached(validated_symbol)
+        except RuntimeError as re:
+            return JSONResponse({"success": False, "error": str(re)}, status_code=500)
 
         pause = _portfolio_pause_status(user_id)
         if pause["recommend_pause"]:
-            sig["call"] = "HOLD"
-            sig["reason"] = f"streak-risk pause ({pause['reason']})"
+            sig = {**sig, "call": "HOLD", "reason": f"streak-risk pause ({pause['reason']})"}
         sig["pause_override"] = pause["recommend_pause"]
         sig["pause"] = pause
 
@@ -2021,6 +2071,60 @@ async def api_get_signal(request: StarletteRequest) -> JSONResponse:
     except Exception as e:
         log_error(e, "api_get_signal")
         return JSONResponse({"success": False, "error": "Failed to compute signal"},
+                            status_code=500)
+
+
+@mcp.custom_route("/api/signals", methods=["GET"])
+async def api_get_signals_batch(request: StarletteRequest) -> JSONResponse:
+    """Batch composite signals for many symbols in a single round trip.
+    Query: ?symbols=R_50,R_75,...  (defaults to TICK_SYMBOLS volatility set)."""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
+    try:
+        raw = request.query_params.get("symbols", "")
+        if raw:
+            req_symbols = [s.strip() for s in raw.split(",") if s.strip()]
+        else:
+            req_symbols = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V"]
+
+        validated: list[str] = []
+        errors: dict[str, str] = {}
+        for s in req_symbols:
+            v, err = validate_symbol(s)
+            if err:
+                errors[s] = err
+            else:
+                validated.append(v)
+
+        results = await asyncio.gather(
+            *(_get_signal_cached(s) for s in validated),
+            return_exceptions=True,
+        )
+
+        pause = _portfolio_pause_status(user_id)
+        signals: dict[str, dict] = {}
+        for sym, res in zip(validated, results):
+            if isinstance(res, Exception):
+                errors[sym] = str(res)
+                continue
+            sig = dict(res)  # copy so we don't mutate the cached dict
+            if pause["recommend_pause"]:
+                sig["call"] = "HOLD"
+                sig["reason"] = f"streak-risk pause ({pause['reason']})"
+            sig["pause_override"] = pause["recommend_pause"]
+            signals[sym] = sig
+
+        log_api_call("/api/signals", "GET", 200)
+        return JSONResponse({
+            "success": True,
+            "signals": signals,
+            "pause": pause,
+            "errors": errors,
+        })
+    except Exception as e:
+        log_error(e, "api_get_signals_batch")
+        return JSONResponse({"success": False, "error": "Failed to compute signals"},
                             status_code=500)
 
 

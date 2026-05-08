@@ -498,7 +498,7 @@ class DerivTradingApp(App):
         self._timer_market  = self.set_interval(5, self.refresh_market_data)
         self._timer_history = self.set_interval(15, self.refresh_history)
         self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
-        self._timer_signals = self.set_interval(10, self.refresh_signals)
+        self._timer_signals = self.set_interval(3, self.refresh_signals)
 
     # ─── Data fetchers ────────────────────────────────────────────────────────
 
@@ -758,11 +758,10 @@ class DerivTradingApp(App):
                 closed_short = closed[:16].replace("T", " ") if closed else "—"
 
                 exit_price = t.get("exit_price") or 0
-                # exit_price is a real spot price only when >10; smaller values are payouts, not prices
-                exit_str = f"{exit_price:.2f}" if exit_price and exit_price > 0.01 else "—"
+                exit_str = f"{exit_price:.5f}" if exit_price else "—"
 
                 entry = t.get("entry_price") or 0
-                entry_str = f"{entry:.2f}" if entry > 0.01 else "—"
+                entry_str = f"{entry:.5f}" if entry else "—"
 
                 table.add_row(
                     f"…{trade_id[-6:]}",
@@ -826,44 +825,42 @@ class DerivTradingApp(App):
         await self._fetch_agent_activity()
 
     async def _fetch_signals(self) -> None:
-        """Pull pause-status and per-symbol signals in parallel; update banner + table."""
-        results = await asyncio.gather(
-            api_get("/api/portfolio/pause-status"),
-            *(api_get(f"/api/signals/{sym}") for sym in DEFAULT_SYMBOLS),
-            return_exceptions=True,
-        )
-        pause_resp = results[0]
-        signal_results = results[1:]
+        """Pull pause-status and all signals from the batch endpoint; update banner + table."""
+        symbols_qs = ",".join(DEFAULT_SYMBOLS)
+        try:
+            resp = await api_get(f"/api/signals?symbols={symbols_qs}")
+        except Exception as e:
+            self._log(f"[yellow]signals fetch error: {e}[/yellow]")
+            return
 
-        if isinstance(pause_resp, Exception):
-            self._log(f"[yellow]pause-status fetch error: {pause_resp}[/yellow]")
-        elif pause_resp.get("success"):
-            p = pause_resp.get("pause", {})
-            banner = self.query_one("#pause-banner", Static)
-            banner.remove_class("pause-active")
-            banner.remove_class("pause-clear")
-            if p.get("recommend_pause"):
-                banner.add_class("pause-active")
-                banner.update(
-                    f"⚠  PAUSE RECOMMENDED — {p.get('current_streak', 0)} consecutive losses "
-                    f"(threshold {p.get('threshold', 0)}, max ever {p.get('max_streak', 0)})"
-                )
-            else:
-                banner.add_class("pause-clear")
-                banner.update(
-                    f"✓ Streak OK — current {p.get('current_streak', 0)} / "
-                    f"threshold {p.get('threshold', 0)} / max {p.get('max_streak', 0)}"
-                )
+        if not resp.get("success"):
+            self._log(f"[yellow]signals fetch failed: {resp.get('error')}[/yellow]")
+            return
 
-        rows: list[tuple] = []
-        for sym, resp in zip(DEFAULT_SYMBOLS, signal_results):
-            if isinstance(resp, Exception):
-                self._log(f"[yellow]signal {sym} error: {resp}[/yellow]")
-                continue
-            if not resp.get("success"):
-                continue
-            rows.append((sym, resp.get("signal", {})))
+        p = resp.get("pause", {}) or {}
+        banner = self.query_one("#pause-banner", Static)
+        banner.remove_class("pause-active")
+        banner.remove_class("pause-clear")
+        if p.get("recommend_pause"):
+            banner.add_class("pause-active")
+            banner.update(
+                f"⚠  PAUSE RECOMMENDED — {p.get('current_streak', 0)} consecutive losses "
+                f"(threshold {p.get('threshold', 0)}, max ever {p.get('max_streak', 0)})"
+            )
+        else:
+            banner.add_class("pause-clear")
+            banner.update(
+                f"✓ Streak OK — current {p.get('current_streak', 0)} / "
+                f"threshold {p.get('threshold', 0)} / max {p.get('max_streak', 0)}"
+            )
 
+        signals_map = resp.get("signals", {}) or {}
+        for sym, err in (resp.get("errors") or {}).items():
+            self._log(f"[yellow]signal {sym} error: {err}[/yellow]")
+
+        rows: list[tuple] = [
+            (sym, signals_map[sym]) for sym in DEFAULT_SYMBOLS if sym in signals_map
+        ]
         if not rows:
             return
 
@@ -883,18 +880,58 @@ class DerivTradingApp(App):
                 why = sig.get("reason", "")
 
                 price_text = f"{price:.5f}" if isinstance(price, (int, float)) else "—"
+
+                # RSI: oversold (<30) = bullish bias = green; overbought (>70) = bearish = red
                 rsi_v = rsi.get("value")
-                rsi_text = (
-                    f"{rsi_v:.1f} {rsi.get('label', '')}".strip()
-                    if isinstance(rsi_v, (int, float)) else "—"
-                )
+                rsi_score = rsi.get("score", 0)
+                if isinstance(rsi_v, (int, float)):
+                    rsi_style = (
+                        "bold green" if rsi_score == 1
+                        else "bold red" if rsi_score == -1
+                        else "dim"
+                    )
+                    rsi_text = Text(f"{rsi_v:.1f} {rsi.get('label', '')}".strip(),
+                                    style=rsi_style)
+                else:
+                    rsi_text = Text("—", style="dim")
+
+                # MACD-hist: positive = bullish = green; negative = bearish = red
                 macd_h = macd.get("hist")
-                macd_text = (
-                    f"{macd_h:+.4f} {macd.get('label', '')}".strip()
-                    if isinstance(macd_h, (int, float)) else "—"
+                macd_score = macd.get("score", 0)
+                if isinstance(macd_h, (int, float)):
+                    macd_style = (
+                        "bold green" if macd_score == 1
+                        else "bold red" if macd_score == -1
+                        else "dim"
+                    )
+                    macd_text = Text(f"{macd_h:+.4f} {macd.get('label', '')}".strip(),
+                                     style=macd_style)
+                else:
+                    macd_text = Text("—", style="dim")
+
+                # BB position: below-lower = mean-revert buy = green;
+                # above-upper = mean-revert sell = red; within = grey
+                bb_pos = bb.get("position", "—")
+                bb_score = bb.get("score", 0)
+                bb_style = (
+                    "bold green" if bb_score == 1
+                    else "bold red" if bb_score == -1
+                    else "dim"
                 )
-                bb_text = bb.get("position", "—")
-                score_text = f"{score:+d}"
+                bb_text = Text(bb_pos, style=bb_style)
+
+                # Composite score: + = bullish lean, - = bearish lean
+                if score >= 2:
+                    score_style = "bold green"
+                elif score == 1:
+                    score_style = "green"
+                elif score <= -2:
+                    score_style = "bold red"
+                elif score == -1:
+                    score_style = "red"
+                else:
+                    score_style = "dim"
+                score_text = Text(f"{score:+d}", style=score_style)
 
                 if call == "BUY":
                     call_text = Text("▲ BUY", style="bold green")
