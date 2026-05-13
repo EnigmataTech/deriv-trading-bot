@@ -594,3 +594,20 @@ AST analysis confirmed all 29 methods and 2 classes present with zero missing it
 - JWT signature verification is currently disabled (`verify_signature: False`). In production, implement JWKS fetch from Stytch to verify token signatures.
 - The `AUTH_ENABLED=false` bypass is intended for local development only — never deploy with it disabled.
 - Daily loss limits (`MAX_DAILY_LOSS`, `MAX_DAILY_TRADES`) are enforced server-side but not in the TUI's local command path.
+
+---
+
+## Disclaimer
+
+**This software trades real money on a real exchange. It is provided for educational and personal use only.**
+
+- Binary options and CFDs are high-risk financial instruments. Most retail traders lose money.
+- Nothing in this repository constitutes financial advice. The signal logic (composite RSI + MACD + Bollinger Bands) is a textbook indicator combination, not a proven strategy.
+- The author runs this against their own Deriv account. **You** are responsible for any trades placed through your account, including losses caused by bugs, network failures, exchange issues, or misuse.
+- Always test with a Deriv demo account first (`DERIV_APP_ID=1089` against `demo`). Never run against real funds without understanding the entire trade lifecycle, including how positions are sized, when stop-losses fire, and what happens on disconnect.
+- No warranty. See [LICENSE](#license).
+
+## License
+
+MIT — use it, fork it, modify it. The author is not liable for trading losses, data loss, or any other damages arising from use of this software.
+
