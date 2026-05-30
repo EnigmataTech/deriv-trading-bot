@@ -198,9 +198,8 @@ def get_user_id() -> str:
     if ctx_user_id:
         return ctx_user_id
     # MCP tool calls have no REST context — use the configured agent identity
-    agent_user_id = os.getenv("MCP_AGENT_USER_ID")
-    if agent_user_id:
-        return agent_user_id
+    if MCP_AGENT_USER_ID:
+        return MCP_AGENT_USER_ID
     raise ValueError("No authenticated user in context")
 
 def extract_user_from_request(request: StarletteRequest) -> Optional[str]:
@@ -758,31 +757,27 @@ def _portfolio_pause_status(user_id: str) -> dict:
 # ============ MCP Tools ============
 
 @mcp.tool()
-def get_account_balance() -> str:
+async def get_account_balance() -> str:
     """Get current account balance from Deriv"""
-    return asyncio.run(_do_get_balance())
+    return await _do_get_balance()
 
 @mcp.tool()
-def get_market_data(symbol: str) -> str:
+async def get_market_data(symbol: str) -> str:
     """Get real-time market data for a trading symbol"""
-    async def _get_market_data():
-        client = await get_deriv_client()
-        try:
-            response = await client.get_ticks(symbol)
-            if 'error' in response:
-                return f"Error: {response['error']['message']}"
-            
-            tick_data = response.get('tick', {})
-            return f"Symbol: {symbol}\nPrice: {tick_data.get('quote', 'N/A')}\nTime: {tick_data.get('epoch', 'N/A')}"
-        finally:
-            pass
-    
-    return asyncio.run(_get_market_data())
+    client = await get_deriv_client()
+    try:
+        response = await client.get_ticks(symbol)
+        if 'error' in response:
+            return f"Error: {response['error']['message']}"
+        tick_data = response.get('tick', {})
+        return f"Symbol: {symbol}\nPrice: {tick_data.get('quote', 'N/A')}\nTime: {tick_data.get('epoch', 'N/A')}"
+    finally:
+        pass
 
 @mcp.tool()
-def place_trade(symbol: str, amount: float, direction: str, duration: int = 5) -> str:
+async def place_trade(symbol: str, amount: float, direction: str, duration: int = 5) -> str:
     """Place a binary options trade. Direction: 'CALL' or 'PUT'"""
-    return _do_place_trade(symbol, amount, direction, duration)
+    return await _do_place_trade_async(symbol, amount, direction, duration)
 
 @mcp.tool()
 def get_trade_history() -> str:
@@ -790,7 +785,7 @@ def get_trade_history() -> str:
     return _do_get_trade_history()
 
 @mcp.tool()
-def calculate_technical_indicators(symbol: str, indicator: str, period: int = 14) -> str:
+async def calculate_technical_indicators(symbol: str, indicator: str, period: int = 14) -> str:
     """Calculate technical indicators for a symbol.
     Supported: sma, ema, rsi, macd, bb (Bollinger Bands), atr.
     MACD uses fast=12, slow=26, signal=9 and ignores the period parameter.
@@ -888,7 +883,7 @@ def calculate_technical_indicators(symbol: str, indicator: str, period: int = 14
         finally:
             pass
 
-    return asyncio.run(_calculate_indicators())
+    return await _calculate_indicators()
 
 @mcp.tool()
 def analyze_portfolio_performance() -> str:
@@ -960,31 +955,28 @@ def analyze_portfolio_performance() -> str:
     return "\n".join(lines)
 
 @mcp.tool()
-def get_active_symbols() -> str:
+async def get_active_symbols() -> str:
     """Get list of active trading symbols"""
-    async def _get_symbols():
-        client = await get_deriv_client()
-        try:
-            response = await client.get_active_symbols()
-            if 'error' in response:
-                return f"Error: {response['error']['message']}"
-            
-            symbols = response.get('active_symbols', [])
-            if not symbols:
-                return "No active symbols found"
-            
-            result = "Active Trading Symbols:\n"
-            for symbol in symbols[:20]:  # Limit to first 20
-                result += f"{symbol.get('symbol', 'N/A')} - {symbol.get('display_name', 'N/A')}\n"
-            
-            if len(symbols) > 20:
-                result += f"... and {len(symbols) - 20} more symbols\n"
-            
-            return result
-        finally:
-            pass
-    
-    return asyncio.run(_get_symbols())
+    client = await get_deriv_client()
+    try:
+        response = await client.get_active_symbols()
+        if 'error' in response:
+            return f"Error: {response['error']['message']}"
+
+        symbols = response.get('active_symbols', [])
+        if not symbols:
+            return "No active symbols found"
+
+        result = "Active Trading Symbols:\n"
+        for symbol in symbols[:20]:
+            result += f"{symbol.get('symbol', 'N/A')} - {symbol.get('display_name', 'N/A')}\n"
+
+        if len(symbols) > 20:
+            result += f"... and {len(symbols) - 20} more symbols\n"
+
+        return result
+    finally:
+        pass
 
 
 @mcp.tool()
@@ -1161,41 +1153,39 @@ def analyze_streak_risk() -> str:
 
 
 @mcp.tool()
-def get_market_signal(symbol: str) -> str:
+async def get_market_signal(symbol: str) -> str:
     """Score-based composite BUY/SELL/HOLD call for a symbol.
     Combines RSI, MACD histogram, and Bollinger-band position.
     Streak-risk pause override forces HOLD when the portfolio is in a danger streak."""
-    async def _do():
-        client = await get_deriv_client()
-        response = await client.get_ticks_history(symbol, count=200)
-        if 'error' in response:
-            return f"Error: {response['error']['message']}"
-        prices = [float(p) for p in response.get('history', {}).get('prices', [])]
-        sig = _compute_market_signal(symbol, prices)
-        try:
-            user_id = get_user_id()
-            pause = _portfolio_pause_status(user_id)
-        except ValueError:
-            pause = {"recommend_pause": False, "reason": "no user context"}
+    client = await get_deriv_client()
+    response = await client.get_ticks_history(symbol, count=200)
+    if 'error' in response:
+        return f"Error: {response['error']['message']}"
+    prices = [float(p) for p in response.get('history', {}).get('prices', [])]
+    sig = _compute_market_signal(symbol, prices)
+    try:
+        user_id = get_user_id()
+        pause = _portfolio_pause_status(user_id)
+    except ValueError:
+        pause = {"recommend_pause": False, "reason": "no user context"}
 
-        if pause["recommend_pause"]:
-            sig["call"] = "HOLD"
-            sig["reason"] = f"streak-risk pause ({pause['reason']})"
+    if pause["recommend_pause"]:
+        sig["call"] = "HOLD"
+        sig["reason"] = f"streak-risk pause ({pause['reason']})"
 
-        if sig.get("rsi") is None:
-            return f"Signal for {symbol}: HOLD ({sig['reason']})"
+    if sig.get("rsi") is None:
+        return f"Signal for {symbol}: HOLD ({sig['reason']})"
 
-        return (
-            f"=== Signal for {symbol} ===\n"
-            f"Price:   {sig['current_price']}\n"
-            f"RSI:     {sig['rsi']['value']:.2f} [{sig['rsi']['label']}]  ({sig['rsi']['score']:+d})\n"
-            f"MACD-h:  {sig['macd']['hist']:+.5f} [{sig['macd']['label']}]  ({sig['macd']['score']:+d})\n"
-            f"BB-pos:  {sig['bb']['position']}  ({sig['bb']['score']:+d})\n"
-            f"Score:   {sig['composite_score']:+d}\n"
-            f"Call:    {sig['call']}\n"
-            f"Why:     {sig['reason']}"
-        )
-    return asyncio.run(_do())
+    return (
+        f"=== Signal for {symbol} ===\n"
+        f"Price:   {sig['current_price']}\n"
+        f"RSI:     {sig['rsi']['value']:.2f} [{sig['rsi']['label']}]  ({sig['rsi']['score']:+d})\n"
+        f"MACD-h:  {sig['macd']['hist']:+.5f} [{sig['macd']['label']}]  ({sig['macd']['score']:+d})\n"
+        f"BB-pos:  {sig['bb']['position']}  ({sig['bb']['score']:+d})\n"
+        f"Score:   {sig['composite_score']:+d}\n"
+        f"Call:    {sig['call']}\n"
+        f"Why:     {sig['reason']}"
+    )
 
 
 # REST API endpoints for n8n integration
