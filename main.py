@@ -1415,7 +1415,7 @@ async def chart_page(request: StarletteRequest) -> HTMLResponse:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Deriv Chart — {{symbol}}</title>
-<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="/static/lightweight-charts.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }}
@@ -1431,8 +1431,8 @@ async def chart_page(request: StarletteRequest) -> HTMLResponse:
   #auto-refresh-btn.active {{ border-color: #3fb950; color: #3fb950; background: #0d3320; }}
   #price-label {{ margin-left: auto; font-size: 20px; font-weight: 700; color: #e6edf3; letter-spacing: 1px; }}
   #main {{ display: flex; flex: 1; overflow: hidden; }}
-  #chart-container {{ flex: 1; position: relative; }}
-  #chart {{ width: 100%; height: 100%; }}
+  #chart-container {{ flex: 1; position: relative; min-height: 0; }}
+  #chart {{ position: absolute; top: 0; left: 0; right: 0; bottom: 0; }}
   #sidebar {{ width: 300px; background: #161b22; border-left: 1px solid #30363d; display: flex; flex-direction: column; overflow: hidden; }}
   #sidebar h2 {{ font-size: 12px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; padding: 12px 16px 8px; border-bottom: 1px solid #30363d; }}
   #trade-list {{ flex: 1; overflow-y: auto; padding: 8px; }}
@@ -1499,8 +1499,7 @@ document.getElementById('symbol-select').value = currentSymbol;
 function initChart() {{
   const container = document.getElementById('chart');
   chart = LightweightCharts.createChart(container, {{
-    width: container.offsetWidth,
-    height: container.offsetHeight,
+    autoSize: true,
     layout: {{ background: {{ color: '#0d1117' }}, textColor: '#8b949e' }},
     grid: {{ vertLines: {{ color: '#21262d' }}, horzLines: {{ color: '#21262d' }} }},
     crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
@@ -1518,7 +1517,6 @@ function initChart() {{
       if (d) document.getElementById('price-label').textContent = d.close.toFixed(4);
     }}
   }});
-  new ResizeObserver(() => chart.resize(container.offsetWidth, container.offsetHeight)).observe(container);
 }}
 
 async function loadData() {{
@@ -1954,6 +1952,17 @@ async def api_prices(request: StarletteRequest) -> JSONResponse:
         asyncio.create_task(_tick_stream.run(TICK_SYMBOLS))
         logger.info(f"Tick stream started for {TICK_SYMBOLS}")
     return JSONResponse({"success": True, "prices": _tick_stream.prices})
+
+
+@mcp.custom_route("/static/lightweight-charts.min.js", methods=["GET"])
+async def serve_lwcharts(request: StarletteRequest) -> Response:
+    js_path = os.path.join(os.path.dirname(__file__), "lightweight-charts.min.js")
+    try:
+        with open(js_path, "rb") as f:
+            return Response(content=f.read(), media_type="application/javascript",
+                            headers={"Cache-Control": "public, max-age=86400"})
+    except FileNotFoundError:
+        return Response(content="// lightweight-charts not bundled", media_type="application/javascript", status_code=404)
 
 
 @mcp.custom_route("/health", methods=["GET"])
