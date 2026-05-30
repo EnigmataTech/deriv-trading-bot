@@ -1409,235 +1409,225 @@ async def _do_place_multiplier_async(
 async def chart_page(request: StarletteRequest) -> HTMLResponse:
     """Candlestick chart with trade entry/exit markers."""
     symbol = request.path_params.get("symbol", "R_100")
-    html = f"""<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Deriv Chart — {{symbol}}</title>
+<title>Deriv Chart</title>
 <script src="/static/lightweight-charts.min.js"></script>
 <style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }}
-  #toolbar {{ display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; flex-shrink: 0; }}
-  #toolbar h1 {{ font-size: 15px; font-weight: 600; color: #58a6ff; margin-right: 8px; }}
-  select {{ background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer; }}
-  select:focus {{ outline: none; border-color: #58a6ff; }}
-  .badge {{ padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }}
-  .badge.buy {{ background: #0d3320; color: #3fb950; border: 1px solid #3fb950; }}
-  .badge.sell {{ background: #3d0f0f; color: #f85149; border: 1px solid #f85149; }}
-  .badge.hold {{ background: #1f2937; color: #8b949e; border: 1px solid #30363d; }}
-  #auto-refresh-btn {{ padding: 5px 14px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #8b949e; font-size: 12px; cursor: pointer; transition: all .2s; }}
-  #auto-refresh-btn.active {{ border-color: #3fb950; color: #3fb950; background: #0d3320; }}
-  #price-label {{ margin-left: auto; font-size: 20px; font-weight: 700; color: #e6edf3; letter-spacing: 1px; }}
-  #main {{ display: flex; flex: 1; overflow: hidden; }}
-  #chart-container {{ flex: 1; position: relative; min-height: 0; }}
-  #chart {{ position: absolute; top: 0; left: 0; right: 0; bottom: 0; }}
-  #sidebar {{ width: 300px; background: #161b22; border-left: 1px solid #30363d; display: flex; flex-direction: column; overflow: hidden; }}
-  #sidebar h2 {{ font-size: 12px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; padding: 12px 16px 8px; border-bottom: 1px solid #30363d; }}
-  #trade-list {{ flex: 1; overflow-y: auto; padding: 8px; }}
-  .trade-card {{ background: #21262d; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; border-left: 3px solid #30363d; }}
-  .trade-card.win {{ border-left-color: #3fb950; }}
-  .trade-card.loss {{ border-left-color: #f85149; }}
-  .trade-card.open {{ border-left-color: #58a6ff; }}
-  .trade-symbol {{ font-size: 13px; font-weight: 700; color: #e6edf3; }}
-  .trade-type {{ font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 4px; display: inline-block; margin-left: 6px; }}
-  .call {{ background: #0d3320; color: #3fb950; }}
-  .put {{ background: #3d0f0f; color: #f85149; }}
-  .trade-prices {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
-  .trade-pnl {{ font-size: 14px; font-weight: 700; margin-top: 2px; }}
-  .trade-pnl.pos {{ color: #3fb950; }}
-  .trade-pnl.neg {{ color: #f85149; }}
-  .trade-pnl.open {{ color: #58a6ff; }}
-  .trade-time {{ font-size: 10px; color: #484f58; margin-top: 3px; }}
-  #status {{ font-size: 11px; color: #484f58; padding: 6px 16px; border-top: 1px solid #30363d; }}
+html, body { margin: 0; padding: 0; background: #0d1117; color: #e6edf3;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+#toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+  background: #161b22; border-bottom: 1px solid #30363d; height: 44px; }
+#toolbar h1 { font-size: 14px; font-weight: 700; color: #58a6ff; margin: 0; }
+select, button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+  border-radius: 5px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+#price { margin-left: auto; font-size: 18px; font-weight: 700; }
+#wrap { display: flex; height: calc(100vh - 44px); }
+#chart-box { flex: 1; }
+#panel { width: 280px; background: #161b22; border-left: 1px solid #30363d;
+  overflow-y: auto; padding: 10px; }
+#panel h2 { font-size: 11px; color: #8b949e; text-transform: uppercase;
+  letter-spacing: 1px; margin: 0 0 8px; }
+.tc { background: #21262d; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
+  border-left: 3px solid #30363d; }
+.tc.win { border-left-color: #3fb950; }
+.tc.loss { border-left-color: #f85149; }
+.tc.open { border-left-color: #58a6ff; }
+.tsym { font-size: 13px; font-weight: 700; }
+.ttype { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px;
+  margin-left: 5px; }
+.call { background: #0d3320; color: #3fb950; }
+.put { background: #3d0f0f; color: #f85149; }
+.tprice { font-size: 11px; color: #8b949e; margin-top: 3px; }
+.tpnl { font-size: 13px; font-weight: 700; }
+.pos { color: #3fb950; } .neg { color: #f85149; } .neutral { color: #58a6ff; }
+.ttime { font-size: 10px; color: #484f58; margin-top: 2px; }
+#err { color: #f85149; padding: 20px; font-size: 13px; display: none; }
+#dbg { color: #8b949e; padding: 8px 14px; font-size: 11px; border-top: 1px solid #30363d; }
 </style>
 </head>
 <body>
 <div id="toolbar">
-  <h1>📈 Deriv</h1>
-  <select id="symbol-select" onchange="changeSymbol(this.value)">
-    <optgroup label="Volatility (Standard)">
-      <option value="R_10">Volatility 10</option>
-      <option value="R_25">Volatility 25</option>
-      <option value="R_50">Volatility 50</option>
-      <option value="R_75">Volatility 75</option>
-      <option value="R_100" selected>Volatility 100</option>
-    </optgroup>
-    <optgroup label="Volatility (1s)">
-      <option value="1HZ10V">Volatility 10 (1s)</option>
-      <option value="1HZ25V">Volatility 25 (1s)</option>
-      <option value="1HZ100V">Volatility 100 (1s)</option>
-    </optgroup>
+  <h1>&#x1F4C8; Deriv</h1>
+  <select id="sym" onchange="go(this.value)">
+    <option value="R_10">Vol 10</option>
+    <option value="R_25">Vol 25</option>
+    <option value="R_50">Vol 50</option>
+    <option value="R_75">Vol 75</option>
+    <option value="R_100">Vol 100</option>
+    <option value="1HZ10V">Vol 10 (1s)</option>
+    <option value="1HZ25V">Vol 25 (1s)</option>
+    <option value="1HZ100V">Vol 100 (1s)</option>
   </select>
-  <select id="tf-select" onchange="changeTf(this.value)">
-    <option value="1m" selected>1m</option>
-    <option value="5m">5m</option>
-    <option value="15m">15m</option>
-    <option value="1h">1h</option>
+  <select id="tf" onchange="load()">
+    <option value="1m">1m</option><option value="5m">5m</option>
+    <option value="15m">15m</option><option value="1h">1h</option>
   </select>
-  <button id="auto-refresh-btn" onclick="toggleAutoRefresh()">⟳ Auto</button>
-  <div id="price-label">—</div>
+  <button onclick="load()">&#x27F3; Refresh</button>
+  <div id="price">—</div>
 </div>
-<div id="main">
-  <div id="chart-container"><div id="chart"></div></div>
-  <div id="sidebar">
-    <h2>Recent Trades</h2>
-    <div id="trade-list"><div style="color:#484f58;padding:16px;font-size:12px">Loading trades...</div></div>
-    <div id="status">Last update: —</div>
-  </div>
+<div id="err"></div>
+<div id="wrap">
+  <div id="chart-box"></div>
+  <div id="panel"><h2>Recent Trades</h2><div id="tlist">Loading...</div></div>
 </div>
+<div id="dbg">Initializing...</div>
 <script>
-const BASE = window.location.origin;
-let currentSymbol = '{symbol}';
-let currentTf = '1m';
-let autoRefreshInterval = null;
-let chart, candleSeries;
+var sym = 'SYMBOL_PLACEHOLDER';
+var chart, cs;
 
-document.getElementById('symbol-select').value = currentSymbol;
+document.getElementById('sym').value = sym;
 
-function initChart() {{
-  const container = document.getElementById('chart');
-  chart = LightweightCharts.createChart(container, {{
-    autoSize: true,
-    layout: {{ background: {{ color: '#0d1117' }}, textColor: '#8b949e' }},
-    grid: {{ vertLines: {{ color: '#21262d' }}, horzLines: {{ color: '#21262d' }} }},
-    crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
-    rightPriceScale: {{ borderColor: '#30363d' }},
-    timeScale: {{ borderColor: '#30363d', timeVisible: true, secondsVisible: false }},
-  }});
-  candleSeries = chart.addCandlestickSeries({{
+function err(msg) {
+  var e = document.getElementById('err');
+  e.style.display = 'block';
+  e.textContent = 'Error: ' + msg;
+  dbg('ERROR: ' + msg);
+}
+
+function dbg(msg) {
+  document.getElementById('dbg').textContent = msg;
+}
+
+function init() {
+  dbg('Checking LightweightCharts...');
+  if (typeof LightweightCharts === 'undefined') {
+    err('LightweightCharts library failed to load. Check /static/lightweight-charts.min.js');
+    return;
+  }
+  dbg('Creating chart...');
+  var box = document.getElementById('chart-box');
+  var w = box.offsetWidth, h = box.offsetHeight;
+  dbg('Container size: ' + w + 'x' + h);
+  if (w === 0 || h === 0) {
+    dbg('WARNING: container is 0px, using window size fallback');
+    w = window.innerWidth - 280;
+    h = window.innerHeight - 44;
+    box.style.width = w + 'px';
+    box.style.height = h + 'px';
+  }
+  chart = LightweightCharts.createChart(box, {
+    width: w, height: h,
+    layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
+    grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
+    rightPriceScale: { borderColor: '#30363d' },
+    timeScale: { borderColor: '#30363d', timeVisible: true },
+  });
+  cs = chart.addCandlestickSeries({
     upColor: '#3fb950', downColor: '#f85149',
     borderUpColor: '#3fb950', borderDownColor: '#f85149',
     wickUpColor: '#3fb950', wickDownColor: '#f85149',
-  }});
-  chart.subscribeCrosshairMove(p => {{
-    if (p.seriesData && p.seriesData.size > 0) {{
-      const d = p.seriesData.get(candleSeries);
-      if (d) document.getElementById('price-label').textContent = d.close.toFixed(4);
-    }}
-  }});
-}}
+  });
+  window.addEventListener('resize', function() {
+    var b = document.getElementById('chart-box');
+    chart.resize(b.offsetWidth, b.offsetHeight);
+  });
+  dbg('Chart created. Loading data...');
+  load();
+}
 
-async function loadData() {{
-  const [candleResp, tradeResp] = await Promise.all([
-    fetch(`${{BASE}}/api/candles/${{currentSymbol}}?timeframe=${{currentTf}}&count=200`),
-    fetch(`${{BASE}}/api/trades/agent`)
-  ]);
-  const candleData = await candleResp.json();
-  const tradeData = await tradeResp.json();
+async function load() {
+  var tf = document.getElementById('tf').value;
+  dbg('Fetching candles for ' + sym + ' (' + tf + ')...');
+  try {
+    var r = await fetch('/api/candles/' + sym + '?timeframe=' + tf + '&count=200');
+    var d = await r.json();
+    if (!d.success) { err('Candle API: ' + (d.error || JSON.stringify(d))); return; }
+    var candles = d.candles.map(function(c) {
+      return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close };
+    });
+    cs.setData(candles);
+    if (candles.length) {
+      document.getElementById('price').textContent = candles[candles.length-1].close.toFixed(4);
+    }
+    dbg('Loaded ' + candles.length + ' candles. Fetching trades...');
 
-  if (!candleData.success) {{ console.error('Candle error:', candleData); return; }}
+    var tr = await fetch('/api/trades/agent');
+    var td = await tr.json();
+    var trades = (td.trades || []);
+    var symTrades = trades.filter(function(t) { return t.symbol === sym; });
+    var times = candles.map(function(c) { return c.time; });
 
-  const candles = candleData.candles.map(c => ({{
-    time: c.time, open: c.open, high: c.high, low: c.low, close: c.close
-  }}));
-  candleSeries.setData(candles);
-
-  if (candles.length > 0) {{
-    document.getElementById('price-label').textContent = candles[candles.length-1].close.toFixed(4);
-  }}
-
-  // Trade markers
-  const trades = (tradeData.trades || []).filter(t => t.symbol === currentSymbol);
-  const markers = [];
-  const candleTimes = candles.map(c => c.time);
-
-  for (const t of trades) {{
-    const isCall = t.type === 'call';
-    const entryEpoch = Math.floor(new Date(t.created_at).getTime() / 1000);
-    const entrySnap = snapToCandle(entryEpoch, candleTimes);
-    if (entrySnap) {{
-      markers.push({{
-        time: entrySnap,
+    var markers = [];
+    symTrades.forEach(function(t) {
+      var isCall = t.type === 'call';
+      var eEpoch = Math.floor(new Date(t.created_at).getTime() / 1000);
+      var esnap = snap(eEpoch, times);
+      if (esnap) markers.push({
+        time: esnap,
         position: isCall ? 'belowBar' : 'aboveBar',
         color: isCall ? '#3fb950' : '#f85149',
         shape: isCall ? 'arrowUp' : 'arrowDown',
-        text: isCall ? `▲ CALL ${{t.entry_price ? t.entry_price.toFixed(4) : ''}}` : `▼ PUT ${{t.entry_price ? t.entry_price.toFixed(4) : ''}}`,
+        text: (isCall ? 'CALL ' : 'PUT ') + (t.entry_price ? t.entry_price.toFixed(3) : ''),
         size: 1.5,
-      }});
-    }}
-    if (t.exit_price && t.closed_at) {{
-      const exitEpoch = Math.floor(new Date(t.closed_at).getTime() / 1000);
-      const exitSnap = snapToCandle(exitEpoch, candleTimes);
-      const won = t.profit_loss > 0;
-      if (exitSnap) {{
-        markers.push({{
-          time: exitSnap,
+      });
+      if (t.exit_price && t.closed_at) {
+        var xEpoch = Math.floor(new Date(t.closed_at).getTime() / 1000);
+        var xsnap = snap(xEpoch, times);
+        var won = (t.profit_loss || 0) > 0;
+        if (xsnap) markers.push({
+          time: xsnap,
           position: isCall ? 'aboveBar' : 'belowBar',
           color: won ? '#3fb950' : '#f85149',
           shape: 'circle',
-          text: `${{won ? '✓' : '✗'}} ${{t.profit_loss > 0 ? '+' : ''}}${{t.profit_loss ? t.profit_loss.toFixed(2) : '?'}}`,
+          text: (won ? '+' : '') + (t.profit_loss ? t.profit_loss.toFixed(2) : '?'),
           size: 1,
-        }});
-      }}
-    }}
-  }}
-  markers.sort((a, b) => a.time - b.time);
-  candleSeries.setMarkers(markers);
+        });
+      }
+    });
+    markers.sort(function(a,b) { return a.time - b.time; });
+    cs.setMarkers(markers);
 
-  renderTrades(tradeData.trades || []);
-  document.getElementById('status').textContent = `Last update: ${{new Date().toLocaleTimeString()}} · ${{candles.length}} candles · ${{trades.length}} trades on chart`;
-}}
+    renderTrades(trades);
+    dbg('Done — ' + candles.length + ' candles, ' + symTrades.length + ' trades on ' + sym + ' | ' + new Date().toLocaleTimeString());
+  } catch(e) {
+    err(e.toString());
+  }
+}
 
-function snapToCandle(epoch, times) {{
+function snap(epoch, times) {
   if (!times.length) return null;
-  let best = times[0], bestDiff = Math.abs(epoch - times[0]);
-  for (const t of times) {{
-    const diff = Math.abs(epoch - t);
-    if (diff < bestDiff) {{ bestDiff = diff; best = t; }}
-  }}
-  return bestDiff < 3600 ? best : null;
-}}
+  var best = times[0], diff = Math.abs(epoch - times[0]);
+  for (var i = 1; i < times.length; i++) {
+    var d = Math.abs(epoch - times[i]);
+    if (d < diff) { diff = d; best = times[i]; }
+  }
+  return diff < 3600 ? best : null;
+}
 
-function renderTrades(trades) {{
-  const list = document.getElementById('trade-list');
-  if (!trades.length) {{ list.innerHTML = '<div style="color:#484f58;padding:16px;font-size:12px">No trades yet</div>'; return; }}
-  const sorted = [...trades].sort((a,b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 30);
-  list.innerHTML = sorted.map(t => {{
-    const isOpen = t.status === 'open';
-    const won = t.profit_loss > 0;
-    const cardClass = isOpen ? 'open' : (won ? 'win' : 'loss');
-    const pnlClass = isOpen ? 'open' : (won ? 'pos' : 'neg');
-    const pnlText = isOpen ? 'OPEN' : `${{t.profit_loss > 0 ? '+' : ''}}$${{t.profit_loss ? Math.abs(t.profit_loss).toFixed(2) : '?'}}`;
-    const typeLabel = t.type === 'call' ? 'CALL' : t.type === 'put' ? 'PUT' : t.type.toUpperCase();
-    const typeClass = t.type === 'call' ? 'call' : 'put';
-    const time = t.created_at ? new Date(t.created_at).toLocaleString([], {{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}}) : '—';
-    return `<div class="trade-card ${{cardClass}}">
-      <div><span class="trade-symbol">${{t.symbol}}</span><span class="trade-type ${{typeClass}}">${{typeLabel}}</span></div>
-      <div class="trade-prices">Entry: ${{t.entry_price ? t.entry_price.toFixed(4) : '—'}} → Exit: ${{t.exit_price ? t.exit_price.toFixed(4) : '—'}}</div>
-      <div class="trade-pnl ${{pnlClass}}">${{pnlText}}</div>
-      <div class="trade-time">${{time}}</div>
-    </div>`;
-  }}).join('');
-}}
+function renderTrades(trades) {
+  var list = document.getElementById('tlist');
+  if (!trades.length) { list.innerHTML = '<div style="color:#484f58;font-size:12px">No trades yet</div>'; return; }
+  var sorted = trades.slice().sort(function(a,b) { return new Date(b.created_at) - new Date(a.created_at); }).slice(0,30);
+  list.innerHTML = sorted.map(function(t) {
+    var isOpen = t.status === 'open';
+    var won = (t.profit_loss || 0) > 0;
+    var cls = isOpen ? 'open' : (won ? 'win' : 'loss');
+    var pnl = isOpen ? '<span class="neutral">OPEN</span>'
+      : '<span class="' + (won?'pos':'neg') + '">' + (won?'+':'') + '$' + Math.abs(t.profit_loss||0).toFixed(2) + '</span>';
+    var typ = (t.type||'').toUpperCase();
+    var tcls = t.type === 'call' ? 'call' : 'put';
+    var ts = t.created_at ? new Date(t.created_at).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+    return '<div class="tc ' + cls + '">'
+      + '<div><span class="tsym">' + t.symbol + '</span><span class="ttype ' + tcls + '">' + typ + '</span></div>'
+      + '<div class="tprice">In: ' + (t.entry_price ? t.entry_price.toFixed(4) : '—') + ' Out: ' + (t.exit_price ? t.exit_price.toFixed(4) : '—') + '</div>'
+      + '<div class="tpnl">' + pnl + '</div>'
+      + '<div class="ttime">' + ts + '</div>'
+      + '</div>';
+  }).join('');
+}
 
-function changeSymbol(sym) {{
-  currentSymbol = sym;
-  history.replaceState(null,'',`/chart/${{sym}}`);
-  loadData();
-}}
+function go(s) { sym = s; history.replaceState(null,'','/chart/'+s); load(); }
 
-function changeTf(tf) {{ currentTf = tf; loadData(); }}
-
-function toggleAutoRefresh() {{
-  const btn = document.getElementById('auto-refresh-btn');
-  if (autoRefreshInterval) {{
-    clearInterval(autoRefreshInterval); autoRefreshInterval = null;
-    btn.classList.remove('active'); btn.textContent = '⟳ Auto';
-  }} else {{
-    autoRefreshInterval = setInterval(loadData, 30000);
-    btn.classList.add('active'); btn.textContent = '⟳ 30s';
-    loadData();
-  }}
-}}
-
-initChart();
-loadData();
+window.addEventListener('load', init);
 </script>
 </body>
-</html>""".replace("{symbol}", symbol)
+</html>""".replace('SYMBOL_PLACEHOLDER', symbol)
     return HTMLResponse(html)
+
+
 
 
 @mcp.custom_route("/api/trade/multiplier", methods=["POST"])
