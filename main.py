@@ -4,7 +4,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, HTMLResponse
 from database import TradingRepository
 from deriv_client import DerivAPIClient, TechnicalIndicators
 from analytics import (
@@ -1402,6 +1402,244 @@ async def _do_place_multiplier_async(
     if take_profit:
         result += f" | TP: ${take_profit}"
     return result
+
+
+@mcp.custom_route("/chart/{symbol}", methods=["GET"])
+@mcp.custom_route("/chart", methods=["GET"])
+async def chart_page(request: StarletteRequest) -> HTMLResponse:
+    """Candlestick chart with trade entry/exit markers."""
+    symbol = request.path_params.get("symbol", "R_100")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deriv Chart — {{symbol}}</title>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }}
+  #toolbar {{ display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; flex-shrink: 0; }}
+  #toolbar h1 {{ font-size: 15px; font-weight: 600; color: #58a6ff; margin-right: 8px; }}
+  select {{ background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer; }}
+  select:focus {{ outline: none; border-color: #58a6ff; }}
+  .badge {{ padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }}
+  .badge.buy {{ background: #0d3320; color: #3fb950; border: 1px solid #3fb950; }}
+  .badge.sell {{ background: #3d0f0f; color: #f85149; border: 1px solid #f85149; }}
+  .badge.hold {{ background: #1f2937; color: #8b949e; border: 1px solid #30363d; }}
+  #auto-refresh-btn {{ padding: 5px 14px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #8b949e; font-size: 12px; cursor: pointer; transition: all .2s; }}
+  #auto-refresh-btn.active {{ border-color: #3fb950; color: #3fb950; background: #0d3320; }}
+  #price-label {{ margin-left: auto; font-size: 20px; font-weight: 700; color: #e6edf3; letter-spacing: 1px; }}
+  #main {{ display: flex; flex: 1; overflow: hidden; }}
+  #chart-container {{ flex: 1; position: relative; }}
+  #chart {{ width: 100%; height: 100%; }}
+  #sidebar {{ width: 300px; background: #161b22; border-left: 1px solid #30363d; display: flex; flex-direction: column; overflow: hidden; }}
+  #sidebar h2 {{ font-size: 12px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; padding: 12px 16px 8px; border-bottom: 1px solid #30363d; }}
+  #trade-list {{ flex: 1; overflow-y: auto; padding: 8px; }}
+  .trade-card {{ background: #21262d; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; border-left: 3px solid #30363d; }}
+  .trade-card.win {{ border-left-color: #3fb950; }}
+  .trade-card.loss {{ border-left-color: #f85149; }}
+  .trade-card.open {{ border-left-color: #58a6ff; }}
+  .trade-symbol {{ font-size: 13px; font-weight: 700; color: #e6edf3; }}
+  .trade-type {{ font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 4px; display: inline-block; margin-left: 6px; }}
+  .call {{ background: #0d3320; color: #3fb950; }}
+  .put {{ background: #3d0f0f; color: #f85149; }}
+  .trade-prices {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
+  .trade-pnl {{ font-size: 14px; font-weight: 700; margin-top: 2px; }}
+  .trade-pnl.pos {{ color: #3fb950; }}
+  .trade-pnl.neg {{ color: #f85149; }}
+  .trade-pnl.open {{ color: #58a6ff; }}
+  .trade-time {{ font-size: 10px; color: #484f58; margin-top: 3px; }}
+  #status {{ font-size: 11px; color: #484f58; padding: 6px 16px; border-top: 1px solid #30363d; }}
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <h1>📈 Deriv</h1>
+  <select id="symbol-select" onchange="changeSymbol(this.value)">
+    <optgroup label="Volatility (Standard)">
+      <option value="R_10">Volatility 10</option>
+      <option value="R_25">Volatility 25</option>
+      <option value="R_50">Volatility 50</option>
+      <option value="R_75">Volatility 75</option>
+      <option value="R_100" selected>Volatility 100</option>
+    </optgroup>
+    <optgroup label="Volatility (1s)">
+      <option value="1HZ10V">Volatility 10 (1s)</option>
+      <option value="1HZ25V">Volatility 25 (1s)</option>
+      <option value="1HZ100V">Volatility 100 (1s)</option>
+    </optgroup>
+  </select>
+  <select id="tf-select" onchange="changeTf(this.value)">
+    <option value="1m" selected>1m</option>
+    <option value="5m">5m</option>
+    <option value="15m">15m</option>
+    <option value="1h">1h</option>
+  </select>
+  <button id="auto-refresh-btn" onclick="toggleAutoRefresh()">⟳ Auto</button>
+  <div id="price-label">—</div>
+</div>
+<div id="main">
+  <div id="chart-container"><div id="chart"></div></div>
+  <div id="sidebar">
+    <h2>Recent Trades</h2>
+    <div id="trade-list"><div style="color:#484f58;padding:16px;font-size:12px">Loading trades...</div></div>
+    <div id="status">Last update: —</div>
+  </div>
+</div>
+<script>
+const BASE = window.location.origin;
+let currentSymbol = '{symbol}';
+let currentTf = '1m';
+let autoRefreshInterval = null;
+let chart, candleSeries;
+
+document.getElementById('symbol-select').value = currentSymbol;
+
+function initChart() {{
+  const container = document.getElementById('chart');
+  chart = LightweightCharts.createChart(container, {{
+    width: container.offsetWidth,
+    height: container.offsetHeight,
+    layout: {{ background: {{ color: '#0d1117' }}, textColor: '#8b949e' }},
+    grid: {{ vertLines: {{ color: '#21262d' }}, horzLines: {{ color: '#21262d' }} }},
+    crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+    rightPriceScale: {{ borderColor: '#30363d' }},
+    timeScale: {{ borderColor: '#30363d', timeVisible: true, secondsVisible: false }},
+  }});
+  candleSeries = chart.addCandlestickSeries({{
+    upColor: '#3fb950', downColor: '#f85149',
+    borderUpColor: '#3fb950', borderDownColor: '#f85149',
+    wickUpColor: '#3fb950', wickDownColor: '#f85149',
+  }});
+  chart.subscribeCrosshairMove(p => {{
+    if (p.seriesData && p.seriesData.size > 0) {{
+      const d = p.seriesData.get(candleSeries);
+      if (d) document.getElementById('price-label').textContent = d.close.toFixed(4);
+    }}
+  }});
+  new ResizeObserver(() => chart.resize(container.offsetWidth, container.offsetHeight)).observe(container);
+}}
+
+async function loadData() {{
+  const [candleResp, tradeResp] = await Promise.all([
+    fetch(`${{BASE}}/api/candles/${{currentSymbol}}?timeframe=${{currentTf}}&count=200`),
+    fetch(`${{BASE}}/api/trades/agent`)
+  ]);
+  const candleData = await candleResp.json();
+  const tradeData = await tradeResp.json();
+
+  if (!candleData.success) {{ console.error('Candle error:', candleData); return; }}
+
+  const candles = candleData.candles.map(c => ({{
+    time: c.time, open: c.open, high: c.high, low: c.low, close: c.close
+  }}));
+  candleSeries.setData(candles);
+
+  if (candles.length > 0) {{
+    document.getElementById('price-label').textContent = candles[candles.length-1].close.toFixed(4);
+  }}
+
+  // Trade markers
+  const trades = (tradeData.trades || []).filter(t => t.symbol === currentSymbol);
+  const markers = [];
+  const candleTimes = candles.map(c => c.time);
+
+  for (const t of trades) {{
+    const isCall = t.type === 'call';
+    const entryEpoch = Math.floor(new Date(t.created_at).getTime() / 1000);
+    const entrySnap = snapToCandle(entryEpoch, candleTimes);
+    if (entrySnap) {{
+      markers.push({{
+        time: entrySnap,
+        position: isCall ? 'belowBar' : 'aboveBar',
+        color: isCall ? '#3fb950' : '#f85149',
+        shape: isCall ? 'arrowUp' : 'arrowDown',
+        text: isCall ? `▲ CALL ${{t.entry_price ? t.entry_price.toFixed(4) : ''}}` : `▼ PUT ${{t.entry_price ? t.entry_price.toFixed(4) : ''}}`,
+        size: 1.5,
+      }});
+    }}
+    if (t.exit_price && t.closed_at) {{
+      const exitEpoch = Math.floor(new Date(t.closed_at).getTime() / 1000);
+      const exitSnap = snapToCandle(exitEpoch, candleTimes);
+      const won = t.profit_loss > 0;
+      if (exitSnap) {{
+        markers.push({{
+          time: exitSnap,
+          position: isCall ? 'aboveBar' : 'belowBar',
+          color: won ? '#3fb950' : '#f85149',
+          shape: 'circle',
+          text: `${{won ? '✓' : '✗'}} ${{t.profit_loss > 0 ? '+' : ''}}${{t.profit_loss ? t.profit_loss.toFixed(2) : '?'}}`,
+          size: 1,
+        }});
+      }}
+    }}
+  }}
+  markers.sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(markers);
+
+  renderTrades(tradeData.trades || []);
+  document.getElementById('status').textContent = `Last update: ${{new Date().toLocaleTimeString()}} · ${{candles.length}} candles · ${{trades.length}} trades on chart`;
+}}
+
+function snapToCandle(epoch, times) {{
+  if (!times.length) return null;
+  let best = times[0], bestDiff = Math.abs(epoch - times[0]);
+  for (const t of times) {{
+    const diff = Math.abs(epoch - t);
+    if (diff < bestDiff) {{ bestDiff = diff; best = t; }}
+  }}
+  return bestDiff < 3600 ? best : null;
+}}
+
+function renderTrades(trades) {{
+  const list = document.getElementById('trade-list');
+  if (!trades.length) {{ list.innerHTML = '<div style="color:#484f58;padding:16px;font-size:12px">No trades yet</div>'; return; }}
+  const sorted = [...trades].sort((a,b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 30);
+  list.innerHTML = sorted.map(t => {{
+    const isOpen = t.status === 'open';
+    const won = t.profit_loss > 0;
+    const cardClass = isOpen ? 'open' : (won ? 'win' : 'loss');
+    const pnlClass = isOpen ? 'open' : (won ? 'pos' : 'neg');
+    const pnlText = isOpen ? 'OPEN' : `${{t.profit_loss > 0 ? '+' : ''}}$${{t.profit_loss ? Math.abs(t.profit_loss).toFixed(2) : '?'}}`;
+    const typeLabel = t.type === 'call' ? 'CALL' : t.type === 'put' ? 'PUT' : t.type.toUpperCase();
+    const typeClass = t.type === 'call' ? 'call' : 'put';
+    const time = t.created_at ? new Date(t.created_at).toLocaleString([], {{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}}) : '—';
+    return `<div class="trade-card ${{cardClass}}">
+      <div><span class="trade-symbol">${{t.symbol}}</span><span class="trade-type ${{typeClass}}">${{typeLabel}}</span></div>
+      <div class="trade-prices">Entry: ${{t.entry_price ? t.entry_price.toFixed(4) : '—'}} → Exit: ${{t.exit_price ? t.exit_price.toFixed(4) : '—'}}</div>
+      <div class="trade-pnl ${{pnlClass}}">${{pnlText}}</div>
+      <div class="trade-time">${{time}}</div>
+    </div>`;
+  }}).join('');
+}}
+
+function changeSymbol(sym) {{
+  currentSymbol = sym;
+  history.replaceState(null,'',`/chart/${{sym}}`);
+  loadData();
+}}
+
+function changeTf(tf) {{ currentTf = tf; loadData(); }}
+
+function toggleAutoRefresh() {{
+  const btn = document.getElementById('auto-refresh-btn');
+  if (autoRefreshInterval) {{
+    clearInterval(autoRefreshInterval); autoRefreshInterval = null;
+    btn.classList.remove('active'); btn.textContent = '⟳ Auto';
+  }} else {{
+    autoRefreshInterval = setInterval(loadData, 30000);
+    btn.classList.add('active'); btn.textContent = '⟳ 30s';
+    loadData();
+  }}
+}}
+
+initChart();
+loadData();
+</script>
+</body>
+</html>""".replace("{symbol}", symbol)
+    return HTMLResponse(html)
 
 
 @mcp.custom_route("/api/trade/multiplier", methods=["POST"])
