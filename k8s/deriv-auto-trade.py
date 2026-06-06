@@ -84,11 +84,14 @@ for sym in SYMBOLS:
     macd_str = "bull" if (macd_v.get("hist", 0) or 0) > 0 else "bear"
     bb_str = bb_v.get("position", "—") if bb_v else "—"
 
+    # Trade on the composite score's sign/magnitude directly. The server only
+    # sets `call` to BUY/SELL at ±2, so gating on it would silently pin us to
+    # ±2 regardless of BUY_THRESHOLD.
     action, emoji = "HOLD", ""
-    if score >= BUY_THRESHOLD and call == "BUY":
+    if score >= BUY_THRESHOLD:
         action, emoji = "CALL ✓", "🟢"
         trades_to_place.append({"symbol": sym, "direction": "CALL", "score": score})
-    elif score <= SELL_THRESHOLD and call == "SELL":
+    elif score <= SELL_THRESHOLD:
         action, emoji = "PUT ✓", "🔴"
         trades_to_place.append({"symbol": sym, "direction": "PUT", "score": score})
 

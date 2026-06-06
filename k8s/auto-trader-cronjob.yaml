@@ -31,11 +31,11 @@ spec:
                 - name: TRADE_AMOUNT
                   value: "1.0"
                 - name: TRADE_DURATION
-                  value: "5"
+                  value: "10"          # ticks (max for binaries) — longest hold so positions show
                 - name: TRADE_DURATION_UNIT
                   value: "t"
                 - name: BUY_THRESHOLD
-                  value: "2"
+                  value: "1"           # trade on score sign (see script); ±1 = active
               volumeMounts:
                 - name: script
                   mountPath: /scripts
