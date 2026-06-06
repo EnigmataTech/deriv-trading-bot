@@ -181,11 +181,15 @@ class DerivAPIClient:
             "basis": "stake",
             "currency": currency,
         }
+        # Deriv's buy `limit_order` takes flat numeric amounts, not the
+        # {order_type, order_amount} sub-objects (that shape is only in
+        # proposal_open_contract responses). Sending sub-objects fails schema
+        # validation ("parameters/limit_order/stop_loss").
         limit_order: Dict[str, Any] = {}
         if stop_loss is not None and stop_loss > 0:
-            limit_order["stop_loss"] = {"order_type": "stop", "order_amount": stop_loss}
+            limit_order["stop_loss"] = stop_loss
         if take_profit is not None and take_profit > 0:
-            limit_order["take_profit"] = {"order_type": "limit", "order_amount": take_profit}
+            limit_order["take_profit"] = take_profit
         if limit_order:
             params["limit_order"] = limit_order
         return await self.send_request({"buy": 1, "price": amount, "parameters": params})
