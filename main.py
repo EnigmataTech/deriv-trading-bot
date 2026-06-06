@@ -1348,6 +1348,36 @@ SYMBOL_MULTIPLIERS: dict[str, list[int]] = {
     "1HZ100V": [40, 100, 200, 300, 400],
 }
 
+# Live multiplier ranges fetched from Deriv contracts_for (the static table
+# above is out of sync for several symbols). Cached per symbol; falls back to
+# the static table if the live fetch is unavailable.
+_live_multiplier_cache: dict[str, list[int]] = {}
+
+async def get_live_multipliers(symbol: str) -> list[int]:
+    """Valid multipliers for a symbol per Deriv, cached; static table as fallback."""
+    if symbol in _live_multiplier_cache:
+        return _live_multiplier_cache[symbol]
+    try:
+        client = await get_deriv_client()
+        resp = await client.get_contracts_for(symbol)
+        mults: set[int] = set()
+        for c in resp.get("contracts_for", {}).get("available", []):
+            cat = (c.get("contract_category") or "").lower()
+            ctype = (c.get("contract_type") or "").lower()
+            if cat == "multiplier" or ctype in ("multup", "multdown"):
+                for m in (c.get("multiplier_range") or c.get("multipliers") or []):
+                    try:
+                        mults.add(int(m))
+                    except (ValueError, TypeError):
+                        pass
+        result = sorted(mults)
+        if result:
+            _live_multiplier_cache[symbol] = result
+            return result
+    except Exception as e:
+        log_error(e, "get_live_multipliers")
+    return SYMBOL_MULTIPLIERS.get(symbol, [])
+
 async def _do_place_multiplier_async(
     symbol: str,
     direction: str,
@@ -1362,7 +1392,7 @@ async def _do_place_multiplier_async(
     if not can_trade:
         return f"Trade blocked: {limit_error}"
 
-    valid = SYMBOL_MULTIPLIERS.get(symbol, [])
+    valid = await get_live_multipliers(symbol)
     if valid and multiplier not in valid:
         return f"Invalid multiplier {multiplier}x for {symbol}. Valid: {valid}"
 
@@ -1688,9 +1718,9 @@ async def api_place_multiplier(request: StarletteRequest) -> JSONResponse:
 
 
 @mcp.custom_route("/api/multipliers/{symbol}", methods=["GET"])
-def api_get_multipliers(request: StarletteRequest) -> JSONResponse:
+async def api_get_multipliers(request: StarletteRequest) -> JSONResponse:
     symbol = request.path_params["symbol"].upper()
-    multipliers = SYMBOL_MULTIPLIERS.get(symbol, [])
+    multipliers = await get_live_multipliers(symbol)
     return JSONResponse({"success": True, "symbol": symbol, "multipliers": multipliers})
 
 @mcp.custom_route("/api/trade", methods=["POST"])

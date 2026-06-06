@@ -75,6 +75,15 @@ class DerivAPIClient:
             "product_type": "basic"
         }
         return await self.send_request(request)
+
+    async def get_contracts_for(self, symbol: str, currency: str = "USD") -> Dict[str, Any]:
+        """Get available contracts for a symbol, including multiplier ranges."""
+        request = {
+            "contracts_for": symbol,
+            "currency": currency,
+            "product_type": "basic",
+        }
+        return await self.send_request(request)
     
     async def get_ticks(self, symbol: str) -> Dict[str, Any]:
         """Get the latest tick for a symbol using one-shot history (avoids subscription streams)."""

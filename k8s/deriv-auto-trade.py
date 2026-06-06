@@ -16,20 +16,15 @@ import sys
 from datetime import datetime, timezone
 
 BASE = os.getenv("TRADING_API_URL", "http://deriv-trading-bot:8000")
-# Only symbols whose multiplier in LOWEST_MULT is actually accepted by Deriv.
-# The bot's SYMBOL_MULTIPLIERS table is out of sync with Deriv for several
-# symbols (R_10/R_25/R_75/1HZ10V/1HZ25V) — those are excluded until the table
-# is fixed from Deriv's contracts_for.
-SYMBOLS = ["R_50", "R_100", "1HZ100V"]
+# Low-leverage symbols only — their minimum multiplier is small enough that
+# positions hold long enough to watch. R_10/R_25/1HZ10V/1HZ25V are excluded:
+# their lowest multiplier is 160x–400x, so SL/TP triggers almost instantly.
+SYMBOLS = ["R_50", "R_75", "R_100", "1HZ100V"]
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "5.0"))   # stake must exceed STOP_LOSS
 STOP_LOSS = float(os.getenv("STOP_LOSS", "2"))
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "4"))
 BUY_THRESHOLD = int(os.getenv("BUY_THRESHOLD", "1"))
 SELL_THRESHOLD = -BUY_THRESHOLD
-
-# Lowest valid multiplier per symbol (from the bot's SYMBOL_MULTIPLIERS).
-LOWEST_MULT = {"R_50": 80, "R_100": 40, "1HZ100V": 40}
-
 
 def fetch(path, method="GET", body=None):
     url = BASE + path
@@ -43,6 +38,12 @@ def fetch(path, method="GET", body=None):
         return {"success": False, "error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def lowest_multiplier(sym):
+    """Lowest multiplier Deriv currently offers for the symbol (least leverage)."""
+    ms = fetch(f"/api/multipliers/{sym}").get("multipliers") or []
+    return min(ms) if ms else 0
 
 
 def fmt_score(s):
@@ -104,7 +105,9 @@ if not to_place:
 else:
     lines.append("**Positions Opened:**")
     for sym, direction, score in to_place:
-        mult = LOWEST_MULT.get(sym, 0)
+        mult = lowest_multiplier(sym)
+        if not mult:
+            lines.append(f"- {sym}: {direction} — ❌ no multiplier available"); continue
         result = fetch("/api/trade/multiplier", method="POST", body={
             "symbol": sym, "direction": direction, "amount": TRADE_AMOUNT,
             "multiplier": mult, "stop_loss": STOP_LOSS, "take_profit": TAKE_PROFIT,
