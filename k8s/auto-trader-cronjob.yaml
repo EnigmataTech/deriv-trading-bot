@@ -29,11 +29,11 @@ spec:
                 - name: TRADING_API_URL
                   value: "http://deriv-trading-bot:8000"
                 - name: TRADE_AMOUNT
-                  value: "1.0"
-                - name: TRADE_DURATION
-                  value: "10"          # ticks (max for binaries) — longest hold so positions show
-                - name: TRADE_DURATION_UNIT
-                  value: "t"
+                  value: "5.0"         # stake; must exceed STOP_LOSS
+                - name: STOP_LOSS
+                  value: "2"
+                - name: TAKE_PROFIT
+                  value: "4"
                 - name: BUY_THRESHOLD
                   value: "1"           # trade on score sign (see script); ±1 = active
               volumeMounts:
