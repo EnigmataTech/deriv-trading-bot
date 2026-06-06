@@ -873,6 +873,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "numpy" },
     { name = "pandas" },
+    { name = "plotext" },
     { name = "psycopg2-binary" },
     { name = "python-dotenv" },
     { name = "python-jose" },
@@ -881,6 +882,7 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "stytch" },
     { name = "textual" },
+    { name = "textual-plotext" },
     { name = "websockets" },
 ]
 
@@ -890,6 +892,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=2.11.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pandas", specifier = ">=2.2.0" },
+    { name = "plotext", specifier = ">=5.2.8" },
     { name = "psycopg2-binary", specifier = ">=2.9.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "python-jose", specifier = ">=3.5.0" },
@@ -898,6 +901,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0.42" },
     { name = "stytch", specifier = ">=13.12.0" },
     { name = "textual", specifier = ">=0.47.0" },
+    { name = "textual-plotext", specifier = ">=0.2.1" },
     { name = "websockets", specifier = ">=12.0" },
 ]
 
@@ -1156,6 +1160,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/9f/4a/0883b8e3802965322523f0b200ecf33d31f10991d0401162f4b23c698b42/platformdirs-4.9.6.tar.gz", hash = "sha256:3bfa75b0ad0db84096ae777218481852c0ebc6c727b3168c1b9e0118e458cf0a", size = 29400, upload-time = "2026-04-09T00:04:10.812Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/75/a6/a0a304dc33b49145b21f4808d763822111e67d1c3a32b524a1baf947b6e1/platformdirs-4.9.6-py3-none-any.whl", hash = "sha256:e61adb1d5e5cb3441b4b7710bea7e4c12250ca49439228cc1021c00dcfac0917", size = 21348, upload-time = "2026-04-09T00:04:09.463Z" },
+]
+
+[[package]]
+name = "plotext"
+version = "5.3.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c9/d7/f75f397af966fe252d0d34ffd3cae765317fce2134f925f95e7d6725d1ce/plotext-5.3.2.tar.gz", hash = "sha256:52d1e932e67c177bf357a3f0fe6ce14d1a96f7f7d5679d7b455b929df517068e", size = 61967, upload-time = "2024-09-24T15:13:37.728Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f6/1e/12fe7c40cd2099a1f454518754ed229b01beaf3bbb343127f0cc13ce6c22/plotext-5.3.2-py3-none-any.whl", hash = "sha256:394362349c1ddbf319548cfac17ca65e6d5dfc03200c40dfdc0503b3e95a2283", size = 64047, upload-time = "2024-09-24T15:13:36.296Z" },
 ]
 
 [[package]]
@@ -1784,6 +1797,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/19/89/bec5709fb759f9c784bbcb30b2e3497df3f901691d13c2b864dbf6694a17/textual-8.2.4.tar.gz", hash = "sha256:d4e2b2ddd7157191d00b228592b7c739ea080b7d792fd410f23ca75f05ea76c4", size = 1848933, upload-time = "2026-04-19T04:20:45.845Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5c/32/02932f0d597cdbb34e34bf24266ff0f2cf292ccb3aafc37dd9efcb0cc416/textual-8.2.4-py3-none-any.whl", hash = "sha256:a83bd3f0cc7125ca203845af753f9d6b6be030025ecd1b05cc75ebe645b9c4ba", size = 724390, upload-time = "2026-04-19T04:20:49.968Z" },
+]
+
+[[package]]
+name = "textual-plotext"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "plotext" },
+    { name = "textual" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9a/b0/e4e0f38df057db778252db0dd2c08522d7222b8537b6a0181d797b9044bd/textual_plotext-1.0.1.tar.gz", hash = "sha256:836f53a3316756609e194129a35c2875638e7958c261f541e0a794f7c98011be", size = 16489, upload-time = "2024-11-30T19:25:56.625Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/35/53/fba7da208f9d3f59254413660fa0aa6599f2aca806f3ae356670455fd4ea/textual_plotext-1.0.1-py3-none-any.whl", hash = "sha256:6b6bfd00b29f121ddf216eaaf9bdac9d688ed72f40028484d279a10cbbb169ed", size = 16558, upload-time = "2024-11-30T19:25:32.208Z" },
 ]
 
 [[package]]
