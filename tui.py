@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Any
 
 import aiohttp
@@ -38,6 +38,7 @@ from textual.widgets import (
     TabPane,
 )
 from textual import work
+from textual_plotext import PlotextPlot
 
 from logger import setup_logging
 from symbols import get_short_name
@@ -267,6 +268,13 @@ class DerivTradingApp(App):
     /* ── History ───────────────────────────── */
     #history-table { height: 1fr; }
 
+    /* ── Chart ─────────────────────────────── */
+    #chart-controls { height: 3; padding: 0 1; align: left middle; }
+    #chart-controls Label  { width: auto; padding: 0 1 0 2; content-align: left middle; }
+    #chart-controls Select { width: 18; }
+    #chart-plot   { height: 1fr; }
+    #chart-status { height: 1; padding: 0 1; color: $text-muted; }
+
     /* ── Modal ─────────────────────────────── */
     #modal-container {
         background: $surface;
@@ -291,6 +299,7 @@ class DerivTradingApp(App):
         Binding("1", "switch_tab('tab-dashboard')", "Dashboard"),
         Binding("2", "switch_tab('tab-place')",     "Trade"),
         Binding("3", "switch_tab('tab-history')",   "History"),
+        Binding("4", "switch_tab('tab-chart')",     "Chart"),
         Binding("c", "close_trade",         "Close Trade"),
         Binding("r", "refresh_all",         "Refresh"),
         Binding("a", "toggle_auto_refresh", "Auto"),
@@ -320,6 +329,9 @@ class DerivTradingApp(App):
         self._mkt_row_keys: dict[str, Any] = {}   # symbol → RowKey
         self._sig_row_keys: dict[str, Any] = {}   # symbol → RowKey for signals-table
         self._timer_signals: Optional[Timer] = None
+        self._chart_symbol: str = "R_100"
+        self._chart_tf: str = "1m"
+        self._timer_chart: Optional[Timer] = None
 
     # ─── Layout ──────────────────────────────────────────────────────────────
 
@@ -428,6 +440,26 @@ class DerivTradingApp(App):
             with TabPane("History  [3]", id="tab-history"):
                 yield DataTable(id="history-table")
 
+            # ── Chart ──────────────────────────────────────────────────────
+            with TabPane("Chart  [4]", id="tab-chart"):
+                with Horizontal(id="chart-controls"):
+                    yield Label("Symbol")
+                    yield Select(
+                        options=[(s, s) for s in ALLOWED_SYMBOLS],
+                        id="chart-symbol",
+                        value=self._chart_symbol,
+                        allow_blank=False,
+                    )
+                    yield Label("Timeframe")
+                    yield Select(
+                        options=[(tf, tf) for tf in ("1m", "5m", "15m", "1h")],
+                        id="chart-tf",
+                        value=self._chart_tf,
+                        allow_blank=False,
+                    )
+                yield PlotextPlot(id="chart-plot", classes="panel")
+                yield Static("Chart: idle", id="chart-status")
+
         yield Footer()
 
     # ─── Lifecycle ───────────────────────────────────────────────────────────
@@ -457,6 +489,8 @@ class DerivTradingApp(App):
         ht = self.query_one("#history-table", DataTable)
         ht.add_columns("ID", "Symbol", "Dir", "Stake", "Entry", "Exit", "P&L", "Closed")
         ht.border_title = "Trade History"
+
+        self.query_one("#chart-plot", PlotextPlot).border_title = "Candlestick Chart"
 
         self.query_one("#sparkline-panel").border_title = "Sparklines  (1m)"
         self.query_one("#agent-log").border_title      = f"Hermes  ({MCP_AGENT_USER_ID})"
@@ -499,6 +533,8 @@ class DerivTradingApp(App):
         self._timer_history = self.set_interval(15, self.refresh_history)
         self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
         self._timer_signals = self.set_interval(3, self.refresh_signals)
+        self._timer_chart   = self.set_interval(10, self.refresh_chart)
+        self.refresh_chart()
 
     # ─── Data fetchers ────────────────────────────────────────────────────────
 
@@ -823,6 +859,91 @@ class DerivTradingApp(App):
     @work(exclusive=True)
     async def refresh_agent_activity(self) -> None:
         await self._fetch_agent_activity()
+
+    # ─── Chart ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_iso(s: str) -> Optional[datetime]:
+        """Parse an API ISO timestamp into a naive-UTC datetime (to match candle epochs)."""
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    async def _fetch_chart(self) -> None:
+        symbol = self._chart_symbol
+        tf = self._chart_tf
+        status = self.query_one("#chart-status", Static)
+        plot = self.query_one("#chart-plot", PlotextPlot)
+        try:
+            resp = await api_get(f"/api/candles/{symbol}?timeframe={tf}&count=120")
+            if not resp.get("success"):
+                status.update(f"[red]Chart: candles unavailable for {symbol}[/red]")
+                return
+            candles = [c for c in resp.get("candles", []) if c.get("close") is not None]
+            candles.sort(key=lambda c: c.get("time") or 0)
+            if not candles:
+                status.update(f"[yellow]Chart: no candle data for {symbol}[/yellow]")
+                return
+
+            times = [datetime.fromtimestamp(int(c["time"]), timezone.utc).replace(tzinfo=None)
+                     for c in candles]
+            data = {
+                "Open":  [float(c["open"])  for c in candles],
+                "High":  [float(c["high"])  for c in candles],
+                "Low":   [float(c["low"])   for c in candles],
+                "Close": [float(c["close"]) for c in candles],
+            }
+
+            # Overlay this symbol's Hermes agent trades that fall inside the visible window
+            t0, t1 = times[0], times[-1]
+            entries_x: list[datetime] = []; entries_y: list[float] = []
+            exits_x:   list[datetime] = []; exits_y:   list[float] = []
+            n_trades = 0
+            try:
+                tr = await api_get("/api/trades/agent")
+                if tr.get("success"):
+                    for t in tr.get("trades", []):
+                        if t.get("symbol") != symbol:
+                            continue
+                        ep, ca = t.get("entry_price"), t.get("created_at")
+                        if ep and ca:
+                            dt = self._parse_iso(ca)
+                            if dt and t0 <= dt <= t1:
+                                entries_x.append(dt); entries_y.append(float(ep)); n_trades += 1
+                        xp, cl = t.get("exit_price"), t.get("closed_at")
+                        if xp and cl:
+                            dt = self._parse_iso(cl)
+                            if dt and t0 <= dt <= t1:
+                                exits_x.append(dt); exits_y.append(float(xp))
+            except Exception:
+                pass
+
+            plt = plot.plt
+            plt.clear_figure()
+            plt.theme("dark")
+            plt.date_form("H:M")
+            plt.candlestick([plt.datetime_to_string(t) for t in times], data)
+            if entries_x:
+                plt.scatter([plt.datetime_to_string(t) for t in entries_x], entries_y,
+                            marker="▲", color="green")
+            if exits_x:
+                plt.scatter([plt.datetime_to_string(t) for t in exits_x], exits_y,
+                            marker="▼", color="red")
+            plt.title(f"{symbol} · {tf}")
+            plot.refresh()
+
+            last = data["Close"][-1]
+            status.update(
+                f"{symbol} {tf} · last {last:.5f} · {len(candles)} candles "
+                f"· {n_trades} agent trade(s) overlaid"
+            )
+        except Exception as e:
+            status.update(f"[red]Chart error: {e}[/red]")
+
+    @work(exclusive=True)
+    async def refresh_chart(self) -> None:
+        await self._fetch_chart()
 
     async def _fetch_signals(self) -> None:
         """Pull pause-status and all signals from the batch endpoint; update banner + table."""
@@ -1168,6 +1289,16 @@ class DerivTradingApp(App):
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.tab.id == "tab-history":
             self.refresh_history()
+        elif event.tab.id == "tab-chart":
+            self.refresh_chart()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "chart-symbol" and event.value is not Select.BLANK:
+            self._chart_symbol = str(event.value)
+            self.refresh_chart()
+        elif event.select.id == "chart-tf" and event.value is not Select.BLANK:
+            self._chart_tf = str(event.value)
+            self.refresh_chart()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # Row keys in open trades table are trade_id strings; other tables use symbol names
@@ -1221,7 +1352,7 @@ class DerivTradingApp(App):
     def action_toggle_auto_refresh(self) -> None:
         self._auto_refresh = not self._auto_refresh
         timers = [self._timer_ticks, self._timer_balance, self._timer_open, self._timer_market,
-                  self._timer_history, self._timer_agent]
+                  self._timer_history, self._timer_agent, self._timer_chart]
         if self._auto_refresh:
             self._timer_ticks   = self.set_interval(1,  self.refresh_ticks)
             self._timer_balance = self.set_interval(30, self.refresh_balance)
@@ -1229,6 +1360,7 @@ class DerivTradingApp(App):
             self._timer_market  = self.set_interval(5, self.refresh_market_data)
             self._timer_history = self.set_interval(15, self.refresh_history)
             self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
+            self._timer_chart   = self.set_interval(10, self.refresh_chart)
             self._log("[green]Auto-refresh ON[/green]")
         else:
             for t in timers:
