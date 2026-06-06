@@ -29,11 +29,11 @@ spec:
                 - name: TRADING_API_URL
                   value: "http://deriv-trading-bot:8000"
                 - name: TRADE_AMOUNT
-                  value: "5.0"         # stake; must exceed STOP_LOSS
+                  value: "10.0"        # stake; must exceed STOP_LOSS
                 - name: STOP_LOSS
-                  value: "2"
+                  value: "7"           # ~1.75% adverse @ 40x — near the longest hold possible
                 - name: TAKE_PROFIT
-                  value: "4"
+                  value: "14"
                 - name: BUY_THRESHOLD
                   value: "1"           # trade on score sign (see script); ±1 = active
               volumeMounts:
