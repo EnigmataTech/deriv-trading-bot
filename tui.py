@@ -502,7 +502,7 @@ class DerivTradingApp(App):
         self.call_after_refresh(self._apply_mode)
         self._initialize_app()
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="init")
     async def _initialize_app(self) -> None:
         self._log(f"Connecting to {API_BASE}...")
         try:
@@ -581,7 +581,7 @@ class DerivTradingApp(App):
         except Exception:
             pass
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="ticks")
     async def refresh_ticks(self) -> None:
         await self._fetch_ticks()
 
@@ -599,7 +599,7 @@ class DerivTradingApp(App):
             self._log(f"[red]Balance error: {e}[/red]")
             self._set_status(connected=False)
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="balance")
     async def refresh_balance(self) -> None:
         await self._fetch_balance()
 
@@ -667,7 +667,7 @@ class DerivTradingApp(App):
         except Exception as e:
             self._log(f"[red]Open trades error: {e}[/red]")
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="open_trades")
     async def refresh_open_trades(self) -> None:
         await self._fetch_open_trades()
 
@@ -764,7 +764,7 @@ class DerivTradingApp(App):
         except Exception as e:
             self._log(f"[red]Market table update error: {e}[/red]")
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="market_data")
     async def refresh_market_data(self) -> None:
         await self._fetch_market_data()
 
@@ -812,7 +812,7 @@ class DerivTradingApp(App):
         except Exception as e:
             self._log(f"[red]History error: {e}[/red]")
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="history")
     async def refresh_history(self) -> None:
         await self._fetch_history()
 
@@ -856,7 +856,7 @@ class DerivTradingApp(App):
         except Exception as e:
             self._log(f"[yellow]Activity feed error: {e}[/yellow]")
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="agent_activity")
     async def refresh_agent_activity(self) -> None:
         await self._fetch_agent_activity()
 
@@ -941,7 +941,7 @@ class DerivTradingApp(App):
         except Exception as e:
             status.update(f"[red]Chart error: {e}[/red]")
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="chart")
     async def refresh_chart(self) -> None:
         await self._fetch_chart()
 
@@ -1070,7 +1070,7 @@ class DerivTradingApp(App):
         except Exception as e:
             self._log(f"[red]Signals table update error: {e}[/red]")
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="signals")
     async def refresh_signals(self) -> None:
         await self._fetch_signals()
 
