@@ -891,6 +891,15 @@ class DerivTradingApp(App):
                 status.update(f"[yellow]Chart: no candle data for {symbol}[/yellow]")
                 return
 
+            # Cap candle count to what fits the plot width with even spacing.
+            # Plotting more candles than available columns makes plotext squash
+            # some together (they look paired); ~2 columns per candle keeps gaps
+            # even. The y-axis labels eat ~8 columns.
+            width = plot.size.width or 120
+            max_candles = max(20, (width - 8) // 2)
+            if len(candles) > max_candles:
+                candles = candles[-max_candles:]
+
             times = [datetime.fromtimestamp(int(c["time"]), timezone.utc).replace(tzinfo=None)
                      for c in candles]
             data = {
