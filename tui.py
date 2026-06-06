@@ -909,34 +909,48 @@ class DerivTradingApp(App):
                 "Close": [float(c["close"]) for c in candles],
             }
 
-            # Overlay this symbol's agent trades as full-height vertical lines at
-            # the entry time (green = CALL/up bet, red = PUT/down bet). These read
-            # clearly against the candles, unlike scatter markers which plotext
-            # renders unreliably and the candles overdraw. Open trades also get a
-            # cyan horizontal entry-price line. Only the time window matters for a
-            # vertical line; trades outside it are reported in the status line.
+            # MetaTrader-style overlay: ▲/▼ entry arrows at the entry price
+            # (green=long, red=short), ● exit markers at the exit price (green
+            # win / red loss), a cyan entry-price line for open positions, and an
+            # orange live price line. plt.text places glyphs reliably at data
+            # coordinates (scatter markers don't render dependably).
             t0, t1 = times[0], times[-1]
-            up_marks: list[datetime] = []     # CALL / up-direction entries
-            down_marks: list[datetime] = []   # PUT / down-direction entries
+            last = data["Close"][-1]
+            entries: list[tuple] = []   # (datetime, price, glyph, color)
+            exits: list[tuple] = []     # (datetime, price, color)
             open_lines: list[float] = []
-            n_markers = 0; off_screen = 0; sym_trades = 0
+            n_open = n_closed = off_screen = sym_trades = 0
+            recent_summary: Optional[str] = None
             try:
                 tr = await api_get("/api/trades/agent")
                 if tr.get("success"):
-                    for t in tr.get("trades", []):
+                    for t in sorted(tr.get("trades", []), key=lambda x: x.get("created_at") or ""):
                         if t.get("symbol") != symbol:
                             continue
                         sym_trades += 1
                         ca = self._parse_iso(t.get("created_at") or "")
-                        if not (ca and t0 <= ca <= t1):
+                        ep = t.get("entry_price")
+                        if not (ca and ep and t0 <= ca <= t1):
                             off_screen += 1
                             continue
-                        n_markers += 1
+                        ep = float(ep)
                         is_up = str(t.get("type", "")).lower() in ("call", "buy", "multup")
-                        (up_marks if is_up else down_marks).append(ca)
-                        ep = t.get("entry_price")
-                        if t.get("status") == "open" and ep:
-                            open_lines.append(float(ep))
+                        sign = 1 if is_up else -1
+                        entries.append((ca, ep, "▲" if is_up else "▼", "green" if is_up else "red"))
+                        if t.get("status") == "open":
+                            n_open += 1
+                            open_lines.append(ep)
+                            recent_summary = f"{'▲' if is_up else '▼'} open {(last - ep) * sign:+.2f} pts (floating)"
+                        else:
+                            n_closed += 1
+                            xp = t.get("exit_price"); cl = self._parse_iso(t.get("closed_at") or "")
+                            pnl = t.get("profit_loss")
+                            if xp:
+                                xp = float(xp)
+                                if cl and t0 <= cl <= t1:
+                                    exits.append((cl, xp, "green" if (pnl or 0) >= 0 else "red"))
+                                pnl_s = f"${pnl:+.2f}" if pnl is not None else "?"
+                                recent_summary = f"{'▲' if is_up else '▼'} {(xp - ep) * sign:+.2f} pts → {pnl_s}"
             except Exception:
                 pass
 
@@ -944,25 +958,23 @@ class DerivTradingApp(App):
             plt.clear_figure()
             plt.date_form("H:M")
             plt.candlestick([plt.datetime_to_string(t) for t in times], data)
-            # Live current-price line so market movement is visible every refresh
-            plt.horizontal_line(data["Close"][-1], color="orange")
-            for y in open_lines:
+            plt.horizontal_line(last, color="orange")           # live current price
+            for y in open_lines:                                 # open-position entry price
                 plt.horizontal_line(y, color="cyan")
-            for x in up_marks:
-                plt.vertical_line(plt.datetime_to_string(x), color="green")
-            for x in down_marks:
-                plt.vertical_line(plt.datetime_to_string(x), color="red")
+            for ca, price, glyph, color in entries:              # entry arrows at entry price
+                plt.text(glyph, plt.datetime_to_string(ca), price, color=color)
+            for cl, price, color in exits:                       # exit markers at exit price
+                plt.text("●", plt.datetime_to_string(cl), price, color=color)
             plt.title(f"{symbol} · {tf}")
             plot.refresh()
 
-            last = data["Close"][-1]
-            parts = [f"{symbol} {tf}", f"last {last:.5f}", f"{len(candles)} candles"]
-            if n_markers:
-                parts.append(f"{n_markers} trade(s) ▏green=CALL ▏red=PUT")
-            if open_lines:
-                parts.append(f"{len(open_lines)} open-entry line(s)")
+            parts = [f"{symbol} {tf}", f"last {last:.5f}"]
+            if n_open or n_closed:
+                parts.append(f"▲▼ {n_open} open / {n_closed} closed ●")
+            if recent_summary:
+                parts.append(f"latest: {recent_summary}")
             if off_screen:
-                parts.append(f"{off_screen} trade(s) off-screen")
+                parts.append(f"{off_screen} off-screen")
             if sym_trades == 0:
                 parts.append("no agent trades on this symbol")
             status.update(" · ".join(parts))
