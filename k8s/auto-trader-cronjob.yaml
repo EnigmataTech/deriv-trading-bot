@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: deriv-auto-trader
+  namespace: deriv-trading-bot
+  labels:
+    app: deriv-auto-trader
+spec:
+  schedule: "*/2 * * * *"            # every 2 minutes
+  concurrencyPolicy: Forbid          # never overlap runs
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0                # one shot per tick; next tick retries
+      activeDeadlineSeconds: 60
+      template:
+        metadata:
+          labels:
+            app: deriv-auto-trader
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: auto-trader
+              image: python:3.13-slim
+              command: ["python", "/scripts/deriv-auto-trade.py"]
+              env:
+                - name: TRADING_API_URL
+                  value: "http://deriv-trading-bot:8000"
+                - name: TRADE_AMOUNT
+                  value: "1.0"
+                - name: TRADE_DURATION
+                  value: "5"
+                - name: TRADE_DURATION_UNIT
+                  value: "t"
+                - name: BUY_THRESHOLD
+                  value: "2"
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+          volumes:
+            - name: script
+              configMap:
+                name: deriv-auto-trader-script
