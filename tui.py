@@ -538,7 +538,7 @@ class DerivTradingApp(App):
         self._timer_history = self.set_interval(15, self.refresh_history)
         self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
         self._timer_signals = self.set_interval(3, self.refresh_signals)
-        self._timer_chart   = self.set_interval(10, self.refresh_chart)
+        self._timer_chart   = self.set_interval(2, self.refresh_chart)
         self.refresh_chart()
 
     # ─── Data fetchers ────────────────────────────────────────────────────────
@@ -937,6 +937,8 @@ class DerivTradingApp(App):
             plt.clear_figure()
             plt.date_form("H:M")
             plt.candlestick([plt.datetime_to_string(t) for t in times], data)
+            # Live current-price line so market movement is visible every refresh
+            plt.horizontal_line(data["Close"][-1], color="orange")
             for y in open_lines:
                 plt.horizontal_line(y, color="cyan")
             if entries_x:
@@ -1381,7 +1383,7 @@ class DerivTradingApp(App):
             self._timer_market  = self.set_interval(5, self.refresh_market_data)
             self._timer_history = self.set_interval(15, self.refresh_history)
             self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
-            self._timer_chart   = self.set_interval(10, self.refresh_chart)
+            self._timer_chart   = self.set_interval(2, self.refresh_chart)
             self._log("[green]Auto-refresh ON[/green]")
         else:
             for t in timers:
