@@ -671,10 +671,16 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
 
     rsi_vals = TechnicalIndicators.calculate_rsi(prices, 14)
     rsi_latest = next((x for x in reversed(rsi_vals) if x is not None), None)
+    # Graduated mean-reversion weight: a genuine extreme scores ±2 so it can
+    # outweigh the opposing MACD momentum reading; mild readings stay neutral.
     if rsi_latest is None:
         rsi_score, rsi_label = 0, "n/a"
+    elif rsi_latest < 20:
+        rsi_score, rsi_label = 2, "deeply oversold"
     elif rsi_latest < 30:
         rsi_score, rsi_label = 1, "oversold"
+    elif rsi_latest > 80:
+        rsi_score, rsi_label = -2, "deeply overbought"
     elif rsi_latest > 70:
         rsi_score, rsi_label = -1, "overbought"
     else:
@@ -693,13 +699,24 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
 
     upper, middle, lower = TechnicalIndicators.calculate_bollinger_bands(prices, period=20)
     u = next((x for x in reversed(upper) if x is not None), None)
+    m = next((x for x in reversed(middle) if x is not None), None)
     l = next((x for x in reversed(lower) if x is not None), None)
+    # Graduated by how far price penetrates beyond the band: a deep break past
+    # half a band-width scores ±2 (strong reversion), a shallow break ±1.
     if u is None or l is None:
         bb_score, bb_pos = 0, "n/a"
     elif current < l:
-        bb_score, bb_pos = 1, "below-lower"
+        half = (m - l) if (m is not None and m > l) else None
+        if half and (l - current) > 0.5 * half:
+            bb_score, bb_pos = 2, "far below-lower"
+        else:
+            bb_score, bb_pos = 1, "below-lower"
     elif current > u:
-        bb_score, bb_pos = -1, "above-upper"
+        half = (u - m) if (m is not None and u > m) else None
+        if half and (current - u) > 0.5 * half:
+            bb_score, bb_pos = -2, "far above-upper"
+        else:
+            bb_score, bb_pos = -1, "above-upper"
     else:
         bb_score, bb_pos = 0, "within"
 
