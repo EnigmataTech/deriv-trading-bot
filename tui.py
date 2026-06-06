@@ -490,7 +490,12 @@ class DerivTradingApp(App):
         ht.add_columns("ID", "Symbol", "Dir", "Stake", "Entry", "Exit", "P&L", "Closed")
         ht.border_title = "Trade History"
 
-        self.query_one("#chart-plot", PlotextPlot).border_title = "Candlestick Chart"
+        chart_plot = self.query_one("#chart-plot", PlotextPlot)
+        chart_plot.border_title = "Candlestick Chart"
+        # Pin a high-contrast plotext theme: transparent background + default
+        # terminal foreground for axis labels (the "auto" theme can render the
+        # price axis in a near-invisible colour against the panel surface).
+        chart_plot.theme = "pro"
 
         self.query_one("#sparkline-panel").border_title = "Sparklines  (1m)"
         self.query_one("#agent-log").border_title      = f"Hermes  ({MCP_AGENT_USER_ID})"
@@ -895,35 +900,45 @@ class DerivTradingApp(App):
                 "Close": [float(c["close"]) for c in candles],
             }
 
-            # Overlay this symbol's Hermes agent trades that fall inside the visible window
+            # Overlay this symbol's Hermes agent trades. A marker only shows if it
+            # falls inside both the visible time window and price range; open trades
+            # also get a horizontal entry-price reference line. Anything off-screen or
+            # on another symbol is reported in the status line instead of silently lost.
             t0, t1 = times[0], times[-1]
+            ylo, yhi = min(data["Low"]), max(data["High"])
             entries_x: list[datetime] = []; entries_y: list[float] = []
             exits_x:   list[datetime] = []; exits_y:   list[float] = []
-            n_trades = 0
+            open_lines: list[float] = []
+            n_markers = 0; off_screen = 0; sym_trades = 0
             try:
                 tr = await api_get("/api/trades/agent")
                 if tr.get("success"):
                     for t in tr.get("trades", []):
                         if t.get("symbol") != symbol:
                             continue
-                        ep, ca = t.get("entry_price"), t.get("created_at")
-                        if ep and ca:
-                            dt = self._parse_iso(ca)
-                            if dt and t0 <= dt <= t1:
-                                entries_x.append(dt); entries_y.append(float(ep)); n_trades += 1
-                        xp, cl = t.get("exit_price"), t.get("closed_at")
-                        if xp and cl:
-                            dt = self._parse_iso(cl)
-                            if dt and t0 <= dt <= t1:
-                                exits_x.append(dt); exits_y.append(float(xp))
+                        sym_trades += 1
+                        plotted = False
+                        ep = t.get("entry_price"); ca = self._parse_iso(t.get("created_at") or "")
+                        xp = t.get("exit_price");  cl = self._parse_iso(t.get("closed_at") or "")
+                        if ep and ca and t0 <= ca <= t1 and ylo <= float(ep) <= yhi:
+                            entries_x.append(ca); entries_y.append(float(ep))
+                            n_markers += 1; plotted = True
+                        if xp and cl and t0 <= cl <= t1 and ylo <= float(xp) <= yhi:
+                            exits_x.append(cl); exits_y.append(float(xp))
+                            n_markers += 1; plotted = True
+                        if t.get("status") == "open" and ep and ylo <= float(ep) <= yhi:
+                            open_lines.append(float(ep)); plotted = True
+                        if not plotted:
+                            off_screen += 1
             except Exception:
                 pass
 
             plt = plot.plt
             plt.clear_figure()
-            plt.theme("dark")
             plt.date_form("H:M")
             plt.candlestick([plt.datetime_to_string(t) for t in times], data)
+            for y in open_lines:
+                plt.horizontal_line(y, color="cyan")
             if entries_x:
                 plt.scatter([plt.datetime_to_string(t) for t in entries_x], entries_y,
                             marker="▲", color="green")
@@ -934,10 +949,16 @@ class DerivTradingApp(App):
             plot.refresh()
 
             last = data["Close"][-1]
-            status.update(
-                f"{symbol} {tf} · last {last:.5f} · {len(candles)} candles "
-                f"· {n_trades} agent trade(s) overlaid"
-            )
+            parts = [f"{symbol} {tf}", f"last {last:.5f}", f"{len(candles)} candles"]
+            if n_markers:
+                parts.append(f"{n_markers} marker(s)")
+            if open_lines:
+                parts.append(f"{len(open_lines)} open-entry line(s)")
+            if off_screen:
+                parts.append(f"{off_screen} trade(s) off-screen")
+            if sym_trades == 0:
+                parts.append("no agent trades on this symbol")
+            status.update(" · ".join(parts))
         except Exception as e:
             status.update(f"[red]Chart error: {e}[/red]")
 
