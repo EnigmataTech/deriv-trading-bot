@@ -909,14 +909,15 @@ class DerivTradingApp(App):
                 "Close": [float(c["close"]) for c in candles],
             }
 
-            # Overlay this symbol's Hermes agent trades. A marker only shows if it
-            # falls inside both the visible time window and price range; open trades
-            # also get a horizontal entry-price reference line. Anything off-screen or
-            # on another symbol is reported in the status line instead of silently lost.
+            # Overlay this symbol's agent trades as full-height vertical lines at
+            # the entry time (green = CALL/up bet, red = PUT/down bet). These read
+            # clearly against the candles, unlike scatter markers which plotext
+            # renders unreliably and the candles overdraw. Open trades also get a
+            # cyan horizontal entry-price line. Only the time window matters for a
+            # vertical line; trades outside it are reported in the status line.
             t0, t1 = times[0], times[-1]
-            ylo, yhi = min(data["Low"]), max(data["High"])
-            entries_x: list[datetime] = []; entries_y: list[float] = []
-            exits_x:   list[datetime] = []; exits_y:   list[float] = []
+            up_marks: list[datetime] = []     # CALL / up-direction entries
+            down_marks: list[datetime] = []   # PUT / down-direction entries
             open_lines: list[float] = []
             n_markers = 0; off_screen = 0; sym_trades = 0
             try:
@@ -926,19 +927,16 @@ class DerivTradingApp(App):
                         if t.get("symbol") != symbol:
                             continue
                         sym_trades += 1
-                        plotted = False
-                        ep = t.get("entry_price"); ca = self._parse_iso(t.get("created_at") or "")
-                        xp = t.get("exit_price");  cl = self._parse_iso(t.get("closed_at") or "")
-                        if ep and ca and t0 <= ca <= t1 and ylo <= float(ep) <= yhi:
-                            entries_x.append(ca); entries_y.append(float(ep))
-                            n_markers += 1; plotted = True
-                        if xp and cl and t0 <= cl <= t1 and ylo <= float(xp) <= yhi:
-                            exits_x.append(cl); exits_y.append(float(xp))
-                            n_markers += 1; plotted = True
-                        if t.get("status") == "open" and ep and ylo <= float(ep) <= yhi:
-                            open_lines.append(float(ep)); plotted = True
-                        if not plotted:
+                        ca = self._parse_iso(t.get("created_at") or "")
+                        if not (ca and t0 <= ca <= t1):
                             off_screen += 1
+                            continue
+                        n_markers += 1
+                        is_up = str(t.get("type", "")).lower() in ("call", "buy", "multup")
+                        (up_marks if is_up else down_marks).append(ca)
+                        ep = t.get("entry_price")
+                        if t.get("status") == "open" and ep:
+                            open_lines.append(float(ep))
             except Exception:
                 pass
 
@@ -950,19 +948,17 @@ class DerivTradingApp(App):
             plt.horizontal_line(data["Close"][-1], color="orange")
             for y in open_lines:
                 plt.horizontal_line(y, color="cyan")
-            if entries_x:
-                plt.scatter([plt.datetime_to_string(t) for t in entries_x], entries_y,
-                            marker="▲", color="green")
-            if exits_x:
-                plt.scatter([plt.datetime_to_string(t) for t in exits_x], exits_y,
-                            marker="▼", color="red")
+            for x in up_marks:
+                plt.vertical_line(plt.datetime_to_string(x), color="green")
+            for x in down_marks:
+                plt.vertical_line(plt.datetime_to_string(x), color="red")
             plt.title(f"{symbol} · {tf}")
             plot.refresh()
 
             last = data["Close"][-1]
             parts = [f"{symbol} {tf}", f"last {last:.5f}", f"{len(candles)} candles"]
             if n_markers:
-                parts.append(f"{n_markers} marker(s)")
+                parts.append(f"{n_markers} trade(s) ▏green=CALL ▏red=PUT")
             if open_lines:
                 parts.append(f"{len(open_lines)} open-entry line(s)")
             if off_screen:
