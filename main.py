@@ -21,6 +21,7 @@ from trade_monitor import TradeMonitor
 from jose import jwt
 import os
 import asyncio
+import time
 import json
 from typing import Optional
 from contextvars import ContextVar
@@ -634,11 +635,20 @@ _SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
 _SIGNAL_CACHE_TTL = 3.0  # seconds
 
 
+def _cleanup_signal_cache():
+    """Evict expired entries from _SIGNAL_CACHE to prevent unbounded growth."""
+    now = time.monotonic()
+    expired = [k for k, (ts, _) in _SIGNAL_CACHE.items() if (now - ts) > _SIGNAL_CACHE_TTL]
+    for k in expired:
+        del _SIGNAL_CACHE[k]
+
+
 async def _get_signal_cached(symbol: str) -> dict:
     """Fetch ticks history and compute signal with a per-symbol TTL cache.
     Reduces redundant Deriv WS round-trips when multiple clients (or a batch
     endpoint) ask for the same symbol within the TTL window."""
     import time
+    _cleanup_signal_cache()
     now = time.monotonic()
     cached = _SIGNAL_CACHE.get(symbol)
     if cached and (now - cached[0]) < _SIGNAL_CACHE_TTL:

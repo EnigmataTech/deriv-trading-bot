@@ -271,6 +271,11 @@ class TradeMonitor:
 
         contract_id = trade.trade_id
 
+        # Prevent unbounded growth — safe to clear since it only guards
+        # against double-processing within a polling cycle.
+        if len(self._processed_contracts) > 1000:
+            self._processed_contracts.clear()
+
         # Skip if already processed in this session
         if contract_id in self._processed_contracts:
             return result
