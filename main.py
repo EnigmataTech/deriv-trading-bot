@@ -250,8 +250,8 @@ def require_auth(request: StarletteRequest) -> tuple[Optional[str], Optional[JSO
 
     if not AUTH_ENABLED:
         # Only allow bypass in explicit non-auth mode (for local testing)
-        logger.debug("Authentication disabled - using test user")
-        return "test_user_dev", None
+        logger.debug("Authentication disabled - using configured agent identity")
+        return MCP_AGENT_USER_ID, None
 
     user_id = extract_user_from_request(request)
     if not user_id:
