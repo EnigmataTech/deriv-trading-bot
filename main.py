@@ -450,7 +450,18 @@ async def get_deriv_client() -> DerivAPIClient:
 # ============ Business Logic Functions (shared by MCP tools and REST endpoints) ============
 
 async def _do_get_balance() -> str:
-    """Get account balance from Deriv API"""
+    """Get account balance.
+
+    With DERIV_API_TOKEN: live from Deriv (and snapshot to Postgres portfolios).
+    Without a token (cluster read-only backend): serve the latest Postgres snapshot
+    written by the authorized edge bot — avoids fighting for the single Deriv session.
+    """
+    if not os.getenv("DERIV_API_TOKEN"):
+        user_id = get_user_id()
+        p = TradingRepository.get_portfolio(user_id)
+        if p:
+            return f"Balance: ${p.balance} USD"
+        return "Balance: $0.00 USD (no snapshot yet)"
     client = await get_deriv_client()
     try:
         response = await client.get_account_balance()
@@ -1461,232 +1472,6 @@ async def _do_place_multiplier_async(
     return result
 
 
-@mcp.custom_route("/chart/{symbol}", methods=["GET"])
-@mcp.custom_route("/chart", methods=["GET"])
-async def chart_page(request: StarletteRequest) -> HTMLResponse:
-    """Candlestick chart with trade entry/exit markers."""
-    symbol = request.path_params.get("symbol", "R_100")
-    html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Deriv Chart</title>
-<script src="/static/lightweight-charts.min.js"></script>
-<style>
-html, body { margin: 0; padding: 0; background: #0d1117; color: #e6edf3;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-#toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
-  background: #161b22; border-bottom: 1px solid #30363d; height: 44px; }
-#toolbar h1 { font-size: 14px; font-weight: 700; color: #58a6ff; margin: 0; }
-select, button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
-  border-radius: 5px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
-#price { margin-left: auto; font-size: 18px; font-weight: 700; }
-#wrap { display: flex; height: calc(100vh - 44px); }
-#chart-box { flex: 1; }
-#panel { width: 280px; background: #161b22; border-left: 1px solid #30363d;
-  overflow-y: auto; padding: 10px; }
-#panel h2 { font-size: 11px; color: #8b949e; text-transform: uppercase;
-  letter-spacing: 1px; margin: 0 0 8px; }
-.tc { background: #21262d; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
-  border-left: 3px solid #30363d; }
-.tc.win { border-left-color: #3fb950; }
-.tc.loss { border-left-color: #f85149; }
-.tc.open { border-left-color: #58a6ff; }
-.tsym { font-size: 13px; font-weight: 700; }
-.ttype { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px;
-  margin-left: 5px; }
-.call { background: #0d3320; color: #3fb950; }
-.put { background: #3d0f0f; color: #f85149; }
-.tprice { font-size: 11px; color: #8b949e; margin-top: 3px; }
-.tpnl { font-size: 13px; font-weight: 700; }
-.pos { color: #3fb950; } .neg { color: #f85149; } .neutral { color: #58a6ff; }
-.ttime { font-size: 10px; color: #484f58; margin-top: 2px; }
-#err { color: #f85149; padding: 20px; font-size: 13px; display: none; }
-#dbg { color: #8b949e; padding: 8px 14px; font-size: 11px; border-top: 1px solid #30363d; }
-</style>
-</head>
-<body>
-<div id="toolbar">
-  <h1>&#x1F4C8; Deriv</h1>
-  <select id="sym" onchange="go(this.value)">
-    <option value="R_10">Vol 10</option>
-    <option value="R_25">Vol 25</option>
-    <option value="R_50">Vol 50</option>
-    <option value="R_75">Vol 75</option>
-    <option value="R_100">Vol 100</option>
-    <option value="1HZ10V">Vol 10 (1s)</option>
-    <option value="1HZ25V">Vol 25 (1s)</option>
-    <option value="1HZ100V">Vol 100 (1s)</option>
-  </select>
-  <select id="tf" onchange="load()">
-    <option value="1m">1m</option><option value="5m">5m</option>
-    <option value="15m">15m</option><option value="1h">1h</option>
-  </select>
-  <button onclick="load()">&#x27F3; Refresh</button>
-  <div id="price">—</div>
-</div>
-<div id="err"></div>
-<div id="wrap">
-  <div id="chart-box"></div>
-  <div id="panel"><h2>Recent Trades</h2><div id="tlist">Loading...</div></div>
-</div>
-<div id="dbg">Initializing...</div>
-<script>
-var sym = 'SYMBOL_PLACEHOLDER';
-var chart, cs;
-
-document.getElementById('sym').value = sym;
-
-function err(msg) {
-  var e = document.getElementById('err');
-  e.style.display = 'block';
-  e.textContent = 'Error: ' + msg;
-  dbg('ERROR: ' + msg);
-}
-
-function dbg(msg) {
-  document.getElementById('dbg').textContent = msg;
-}
-
-function init() {
-  dbg('Checking LightweightCharts...');
-  if (typeof LightweightCharts === 'undefined') {
-    err('LightweightCharts library failed to load. Check /static/lightweight-charts.min.js');
-    return;
-  }
-  dbg('Creating chart...');
-  var box = document.getElementById('chart-box');
-  var w = box.offsetWidth, h = box.offsetHeight;
-  dbg('Container size: ' + w + 'x' + h);
-  if (w === 0 || h === 0) {
-    dbg('WARNING: container is 0px, using window size fallback');
-    w = window.innerWidth - 280;
-    h = window.innerHeight - 44;
-    box.style.width = w + 'px';
-    box.style.height = h + 'px';
-  }
-  chart = LightweightCharts.createChart(box, {
-    width: w, height: h,
-    layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
-    grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
-    rightPriceScale: { borderColor: '#30363d' },
-    timeScale: { borderColor: '#30363d', timeVisible: true },
-  });
-  cs = chart.addCandlestickSeries({
-    upColor: '#3fb950', downColor: '#f85149',
-    borderUpColor: '#3fb950', borderDownColor: '#f85149',
-    wickUpColor: '#3fb950', wickDownColor: '#f85149',
-  });
-  window.addEventListener('resize', function() {
-    var b = document.getElementById('chart-box');
-    chart.resize(b.offsetWidth, b.offsetHeight);
-  });
-  dbg('Chart created. Loading data...');
-  load();
-}
-
-async function load() {
-  var tf = document.getElementById('tf').value;
-  dbg('Fetching candles for ' + sym + ' (' + tf + ')...');
-  try {
-    var r = await fetch('/api/candles/' + sym + '?timeframe=' + tf + '&count=200');
-    var d = await r.json();
-    if (!d.success) { err('Candle API: ' + (d.error || JSON.stringify(d))); return; }
-    var candles = d.candles.map(function(c) {
-      return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close };
-    });
-    cs.setData(candles);
-    if (candles.length) {
-      document.getElementById('price').textContent = candles[candles.length-1].close.toFixed(4);
-    }
-    dbg('Loaded ' + candles.length + ' candles. Fetching trades...');
-
-    var tr = await fetch('/api/trades/agent');
-    var td = await tr.json();
-    var trades = (td.trades || []);
-    var symTrades = trades.filter(function(t) { return t.symbol === sym; });
-    var times = candles.map(function(c) { return c.time; });
-
-    var markers = [];
-    symTrades.forEach(function(t) {
-      var isCall = t.type === 'call';
-      var eEpoch = Math.floor(new Date(t.created_at).getTime() / 1000);
-      var esnap = snap(eEpoch, times);
-      if (esnap) markers.push({
-        time: esnap,
-        position: isCall ? 'belowBar' : 'aboveBar',
-        color: isCall ? '#3fb950' : '#f85149',
-        shape: isCall ? 'arrowUp' : 'arrowDown',
-        text: (isCall ? 'CALL ' : 'PUT ') + (t.entry_price ? t.entry_price.toFixed(3) : ''),
-        size: 1.5,
-      });
-      if (t.exit_price && t.closed_at) {
-        var xEpoch = Math.floor(new Date(t.closed_at).getTime() / 1000);
-        var xsnap = snap(xEpoch, times);
-        var won = (t.profit_loss || 0) > 0;
-        if (xsnap) markers.push({
-          time: xsnap,
-          position: isCall ? 'aboveBar' : 'belowBar',
-          color: won ? '#3fb950' : '#f85149',
-          shape: 'circle',
-          text: (won ? '+' : '') + (t.profit_loss ? t.profit_loss.toFixed(2) : '?'),
-          size: 1,
-        });
-      }
-    });
-    markers.sort(function(a,b) { return a.time - b.time; });
-    cs.setMarkers(markers);
-
-    renderTrades(trades);
-    dbg('Done — ' + candles.length + ' candles, ' + symTrades.length + ' trades on ' + sym + ' | ' + new Date().toLocaleTimeString());
-  } catch(e) {
-    err(e.toString());
-  }
-}
-
-function snap(epoch, times) {
-  if (!times.length) return null;
-  var best = times[0], diff = Math.abs(epoch - times[0]);
-  for (var i = 1; i < times.length; i++) {
-    var d = Math.abs(epoch - times[i]);
-    if (d < diff) { diff = d; best = times[i]; }
-  }
-  return diff < 3600 ? best : null;
-}
-
-function renderTrades(trades) {
-  var list = document.getElementById('tlist');
-  if (!trades.length) { list.innerHTML = '<div style="color:#484f58;font-size:12px">No trades yet</div>'; return; }
-  var sorted = trades.slice().sort(function(a,b) { return new Date(b.created_at) - new Date(a.created_at); }).slice(0,30);
-  list.innerHTML = sorted.map(function(t) {
-    var isOpen = t.status === 'open';
-    var won = (t.profit_loss || 0) > 0;
-    var cls = isOpen ? 'open' : (won ? 'win' : 'loss');
-    var pnl = isOpen ? '<span class="neutral">OPEN</span>'
-      : '<span class="' + (won?'pos':'neg') + '">' + (won?'+':'') + '$' + Math.abs(t.profit_loss||0).toFixed(2) + '</span>';
-    var typ = (t.type||'').toUpperCase();
-    var tcls = t.type === 'call' ? 'call' : 'put';
-    var ts = t.created_at ? new Date(t.created_at).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
-    return '<div class="tc ' + cls + '">'
-      + '<div><span class="tsym">' + t.symbol + '</span><span class="ttype ' + tcls + '">' + typ + '</span></div>'
-      + '<div class="tprice">In: ' + (t.entry_price ? t.entry_price.toFixed(4) : '—') + ' Out: ' + (t.exit_price ? t.exit_price.toFixed(4) : '—') + '</div>'
-      + '<div class="tpnl">' + pnl + '</div>'
-      + '<div class="ttime">' + ts + '</div>'
-      + '</div>';
-  }).join('');
-}
-
-function go(s) { sym = s; history.replaceState(null,'','/chart/'+s); load(); }
-
-window.addEventListener('load', init);
-</script>
-</body>
-</html>""".replace('SYMBOL_PLACEHOLDER', symbol)
-    return HTMLResponse(html)
-
-
-
-
 @mcp.custom_route("/api/trade/multiplier", methods=["POST"])
 async def api_place_multiplier(request: StarletteRequest) -> JSONResponse:
     """Place a multiplier (CFD-style) contract."""
@@ -1999,17 +1784,6 @@ async def api_prices(request: StarletteRequest) -> JSONResponse:
         asyncio.create_task(_tick_stream.run(TICK_SYMBOLS))
         logger.info(f"Tick stream started for {TICK_SYMBOLS}")
     return JSONResponse({"success": True, "prices": _tick_stream.prices})
-
-
-@mcp.custom_route("/static/lightweight-charts.min.js", methods=["GET"])
-async def serve_lwcharts(request: StarletteRequest) -> Response:
-    js_path = os.path.join(os.path.dirname(__file__), "lightweight-charts.min.js")
-    try:
-        with open(js_path, "rb") as f:
-            return Response(content=f.read(), media_type="application/javascript",
-                            headers={"Cache-Control": "public, max-age=86400"})
-    except FileNotFoundError:
-        return Response(content="// lightweight-charts not bundled", media_type="application/javascript", status_code=404)
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -2426,6 +2200,19 @@ def api_pause_status(request: StarletteRequest) -> JSONResponse:
                             status_code=500)
 
 
+async def _balance_snapshot_loop() -> None:
+    """Periodically refresh the Postgres portfolio balance snapshot via the shared
+    authorized Deriv client. Runs only on the edge bot (one that has DERIV_API_TOKEN)
+    so the token-less in-cluster read-only backend can serve a current balance."""
+    interval = int(os.getenv("TRADE_MONITOR_INTERVAL", "30"))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _do_get_balance()
+        except Exception as e:
+            logger.warning("Balance snapshot loop error: %s", e)
+
+
 if __name__ == "__main__":
     import signal
     import sys
@@ -2437,6 +2224,11 @@ if __name__ == "__main__":
     # Start the trade monitor
     if os.getenv("ENABLE_TRADE_MONITOR", "true").lower() == "true":
         loop.run_until_complete(start_trade_monitor())
+
+    # On the authorized (edge) bot, periodically refresh the Postgres balance
+    # snapshot so the token-less read-only backend can serve a current balance.
+    if os.getenv("DERIV_API_TOKEN"):
+        loop.create_task(_balance_snapshot_loop())
 
     # Handle graceful shutdown
     def shutdown_handler(signum, frame):

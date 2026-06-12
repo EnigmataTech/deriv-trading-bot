@@ -7,13 +7,6 @@ WORKDIR /app
 COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 
-# Bundle lightweight-charts so the chart page works without internet access
-RUN python3 -c "\
-import urllib.request; \
-urllib.request.urlretrieve(\
-  'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js', \
-  '/app/lightweight-charts.min.js')"
-
 COPY *.py ./
 
 RUN mkdir -p /app/data && chown -R trader:trader /app
