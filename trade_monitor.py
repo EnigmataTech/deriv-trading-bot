@@ -7,6 +7,7 @@ and updates the database when contracts settle.
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
 from contextlib import asynccontextmanager
@@ -52,7 +53,14 @@ class TradeMonitor:
                          a new one will be created.
             poll_interval: Interval in seconds between polling cycles.
         """
-        self.deriv_client = deriv_client or DerivAPIClient()
+        self.broker = os.getenv("BROKER", "deriv").lower()
+        if deriv_client is not None:
+            self.deriv_client = deriv_client
+        elif self.broker == "mt5":
+            from mt5_client import MT5Client
+            self.deriv_client = MT5Client()
+        else:
+            self.deriv_client = DerivAPIClient()
         self.poll_interval = poll_interval
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -81,10 +89,14 @@ class TradeMonitor:
         logger.info("Starting TradeMonitor with %d second poll interval", self.poll_interval)
 
         try:
-            # Connect to Deriv API
+            # Connect to the broker
             connected = await self.deriv_client.connect()
             if not connected:
-                raise TradeMonitorError("Failed to connect to Deriv API")
+                if self.broker == "mt5":
+                    # Bridge may be momentarily busy; reads reconnect lazily.
+                    logger.warning("MT5 initial connect failed; will retry on poll")
+                else:
+                    raise TradeMonitorError("Failed to connect to Deriv API")
 
             # Start the polling loop
             self._task = asyncio.create_task(self._polling_loop())
@@ -156,17 +168,21 @@ class TradeMonitor:
         """
         while self._running:
             try:
-                # Ensure connection before polling
-                if not await self._ensure_connected():
-                    logger.error("Lost connection to Deriv API, waiting before retry")
-                    await asyncio.sleep(self.poll_interval)
-                    continue
+                if self.broker == "mt5":
+                    # MT5 enforces SL/TP server-side; just reconcile closures.
+                    await self._reconcile_mt5()
+                else:
+                    # Ensure connection before polling
+                    if not await self._ensure_connected():
+                        logger.error("Lost connection to Deriv API, waiting before retry")
+                        await asyncio.sleep(self.poll_interval)
+                        continue
 
-                await self.check_open_trades()
-                # Also check stop levels for trades with SL/TP settings
-                await self.check_stop_levels()
-                # Backfill any rows missing entry/exit spot prices from Deriv
-                await self.reconcile_missing_prices()
+                    await self.check_open_trades()
+                    # Also check stop levels for trades with SL/TP settings
+                    await self.check_stop_levels()
+                    # Backfill any rows missing entry/exit spot prices from Deriv
+                    await self.reconcile_missing_prices()
             except Exception as e:
                 logger.error("Error in polling loop: %s", e)
 
@@ -175,6 +191,41 @@ class TradeMonitor:
                 await asyncio.sleep(self.poll_interval)
             except asyncio.CancelledError:
                 break
+
+    async def _reconcile_mt5(self) -> Dict[str, int]:
+        """MT5 settlement reconciliation. SL/TP are enforced server-side, so the
+        monitor only needs to detect when a tracked open ticket has left
+        positions_get() (closed) and settle it from history_deals_get()."""
+        result = {"checked": 0, "closed": 0, "errors": 0}
+        async with self._check_trades_lock:
+            open_trades = [t for t in self._get_open_trades() if t.mt5_ticket]
+            if not open_trades:
+                return result
+            try:
+                positions = await self.deriv_client.get_open_positions()
+            except Exception as e:
+                logger.error("MT5 positions_get failed: %s", e)
+                result["errors"] += 1
+                return result
+            live = {int(p["ticket"]) for p in positions}
+            for t in open_trades:
+                result["checked"] += 1
+                if int(t.mt5_ticket) in live:
+                    continue  # still open
+                try:
+                    close = await self.deriv_client.get_position_close(int(t.mt5_ticket))
+                    if not close.get("closed"):
+                        continue  # not yet resolvable; retry next cycle
+                    await self._update_trade_result(t, {
+                        "exit_price": close.get("exit_price"),
+                        "profit_loss": close.get("profit"),
+                        "closed_at": close.get("closed_at") or datetime.utcnow(),
+                    })
+                    result["closed"] += 1
+                except Exception as e:
+                    logger.error("MT5 reconcile error for ticket %s: %s", t.mt5_ticket, e)
+                    result["errors"] += 1
+        return result
 
     async def check_open_trades(self) -> Dict[str, Any]:
         """

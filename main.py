@@ -435,11 +435,29 @@ def validate_trade_params(body: dict) -> tuple[Optional[dict], Optional[JSONResp
     }, None
 
 _shared_client: Optional[DerivAPIClient] = None
+_mt5_client: Optional[object] = None  # MT5Client instance (BROKER=mt5)
 _tick_stream: Optional[object] = None  # DerivTickStream instance
 
-async def get_deriv_client() -> DerivAPIClient:
-    """Return a shared, persistent Deriv WebSocket client, reconnecting if needed."""
-    global _shared_client
+# Active broker for the trading core. "mt5" = the VPS trader talking to the
+# headless MT5 terminal via the mt5linux bridge; "deriv" = legacy Deriv WS API.
+# The token-less in-cluster read-only backend leaves this at "deriv" (it never
+# trades; it serves snapshots from Postgres).
+BROKER = os.getenv("BROKER", "deriv").lower()
+
+async def get_deriv_client():
+    """Return the active broker client (shared/persistent), reconnecting if needed.
+
+    BROKER=mt5 → MT5Client (the VPS trader). Its read methods return the same
+    Deriv-style shapes the read endpoints already consume, so all market-data /
+    balance call sites work unchanged; the Deriv-specific trade/contract calls
+    are branched on BROKER at their call sites.
+    """
+    global _shared_client, _mt5_client
+    if BROKER == "mt5":
+        if _mt5_client is None:
+            from mt5_client import MT5Client
+            _mt5_client = MT5Client()
+        return _mt5_client
     from websockets.protocol import State
     if _shared_client is None:
         _shared_client = DerivAPIClient()
@@ -453,10 +471,11 @@ async def _do_get_balance() -> str:
     """Get account balance.
 
     With DERIV_API_TOKEN: live from Deriv (and snapshot to Postgres portfolios).
-    Without a token (cluster read-only backend): serve the latest Postgres snapshot
-    written by the authorized edge bot — avoids fighting for the single Deriv session.
+    With BROKER=mt5 (VPS trader): live from the MT5 terminal (and snapshot too).
+    Without a token / not MT5 (cluster read-only backend): serve the latest Postgres
+    snapshot written by the trader — avoids fighting for the single broker session.
     """
-    if not os.getenv("DERIV_API_TOKEN"):
+    if not os.getenv("DERIV_API_TOKEN") and BROKER != "mt5":
         user_id = get_user_id()
         p = TradingRepository.get_portfolio(user_id)
         if p:
@@ -511,6 +530,8 @@ async def _do_place_trade_async(
     trailing_stop_distance: Optional[float] = None
 ) -> str:
     """Place a binary options trade - async business logic"""
+    if BROKER == "mt5":
+        return "Error: binary trades unavailable under MT5 — use POST /api/trade/mt5 (lot + price SL/TP)"
     # Check daily loss limit before placing trade
     user_id = get_user_id()
     can_trade, limit_error = check_daily_loss_limit(user_id)
@@ -1408,6 +1429,11 @@ async def _do_place_multiplier_async(
     take_profit = None,
 ) -> str:
     from typing import Optional
+    if BROKER == "mt5":
+        # MT5 has no Deriv multiplier contracts; map to an MT5-native order
+        # (amount→lot, SL/TP as price levels). multiplier arg is ignored.
+        side = "buy" if direction.upper() in ("BUY", "MULTUP") else "sell"
+        return await _do_place_trade_mt5(symbol, side, amount, stop_loss, take_profit)
     user_id = get_user_id()
     can_trade, limit_error = check_daily_loss_limit(user_id)
     if not can_trade:
@@ -1472,6 +1498,66 @@ async def _do_place_multiplier_async(
     return result
 
 
+async def _do_place_trade_mt5(
+    symbol: str,
+    side: str,
+    lot: float,
+    sl_price: Optional[float] = None,
+    tp_price: Optional[float] = None,
+    entry_price: Optional[float] = None,
+) -> str:
+    """Place an MT5-native order: lot size + price-level SL/TP (+ optional pending
+    entry). Persists trade_id=str(ticket) and the typed mt5_ticket so the monitor
+    can reconcile against positions_get()."""
+    user_id = get_user_id()
+    can_trade, limit_error = check_daily_loss_limit(user_id)
+    if not can_trade:
+        log_audit_trade(event_type="blocked", user_id=user_id, symbol=symbol,
+                        amount=lot, direction=side, success=False, reason=limit_error)
+        return f"Trade blocked: {limit_error}"
+
+    side = side.lower()
+    if side not in ("buy", "sell"):
+        return "Error: side must be 'buy' or 'sell'"
+
+    client = await get_deriv_client()  # MT5Client when BROKER=mt5
+    res = await client.place_order(symbol, side, lot, sl_price=sl_price,
+                                   tp_price=tp_price, entry_price=entry_price)
+    if not res.get("success"):
+        err = res.get("error") or res.get("comment") or f"retcode {res.get('retcode')}"
+        log_error(Exception(str(err)), "place_trade_mt5", error_code="MT5_ORDER_ERROR")
+        log_audit_trade(event_type="place", user_id=user_id, symbol=symbol,
+                        amount=lot, direction=side, success=False, reason=str(err))
+        return f"Error placing MT5 trade: {err}"
+
+    ticket = res.get("ticket")
+    fill = float(res.get("price") or 0)
+    if fill == 0:
+        try:
+            tick_resp = await client.get_ticks(symbol)
+            fill = float(tick_resp.get("tick", {}).get("quote", 0))
+        except Exception:
+            pass
+
+    TradingRepository.create_trade_with_sl_tp(
+        user_id=user_id, trade_id=str(ticket), symbol=symbol,
+        trade_type=side, amount=float(lot), entry_price=fill,
+        stop_loss=sl_price, take_profit=tp_price, mt5_ticket=int(ticket) if ticket else None,
+    )
+    log_trade_placed(symbol=symbol, amount=lot, direction=side.upper(),
+                     contract_type="MT5", duration=0, trade_id=str(ticket))
+    log_audit_trade(event_type="place", user_id=user_id, trade_id=str(ticket),
+                    symbol=symbol, amount=lot, direction=side.upper(), success=True)
+
+    kind = "pending" if entry_price else "market"
+    result = f"MT5 trade placed! #{ticket} | {symbol} {side.upper()} {lot} lot ({kind}) @ {fill}"
+    if sl_price:
+        result += f" | SL: {sl_price}"
+    if tp_price:
+        result += f" | TP: {tp_price}"
+    return result
+
+
 @mcp.custom_route("/api/trade/multiplier", methods=["POST"])
 async def api_place_multiplier(request: StarletteRequest) -> JSONResponse:
     """Place a multiplier (CFD-style) contract."""
@@ -1489,8 +1575,12 @@ async def api_place_multiplier(request: StarletteRequest) -> JSONResponse:
             return JSONResponse({"success": False, "error": "direction must be BUY or SELL"}, status_code=400)
         try:
             amount = float(body.get("amount", 0))
-            if amount < 1.00:
+            # Under MT5 the "amount" is interpreted as lot size (e.g. 0.01); the
+            # $1.00 floor only applies to Deriv multiplier contracts.
+            if BROKER != "mt5" and amount < 1.00:
                 return JSONResponse({"success": False, "error": "amount must be at least $1.00 for multiplier contracts"}, status_code=400)
+            if amount <= 0:
+                return JSONResponse({"success": False, "error": "invalid amount"}, status_code=400)
         except (ValueError, TypeError):
             return JSONResponse({"success": False, "error": "invalid amount"}, status_code=400)
         try:
@@ -1507,6 +1597,47 @@ async def api_place_multiplier(request: StarletteRequest) -> JSONResponse:
         return JSONResponse({"success": True, "data": result})
     except Exception as e:
         log_error(e, "api_place_multiplier")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+    finally:
+        _current_user_id.reset(ctx_token)
+
+
+@mcp.custom_route("/api/trade/mt5", methods=["POST"])
+async def api_place_trade_mt5(request: StarletteRequest) -> JSONResponse:
+    """Place an MT5-native order: {symbol, side: buy|sell, lot, stop_loss?,
+    take_profit?, entry_price?} where SL/TP/entry are price levels."""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
+    ctx_token = _current_user_id.set(user_id)
+    try:
+        body = await request.json()
+        validated_symbol, sym_err = validate_symbol(body.get("symbol", ""))
+        if sym_err:
+            return JSONResponse({"success": False, "error": sym_err}, status_code=400)
+        side = str(body.get("side", body.get("direction", ""))).lower()
+        if side in ("call", "multup"):
+            side = "buy"
+        elif side in ("put", "multdown"):
+            side = "sell"
+        if side not in ("buy", "sell"):
+            return JSONResponse({"success": False, "error": "side must be buy or sell"}, status_code=400)
+        try:
+            lot = float(body.get("lot", body.get("amount", 0)))
+            if lot <= 0:
+                return JSONResponse({"success": False, "error": "lot must be > 0"}, status_code=400)
+        except (ValueError, TypeError):
+            return JSONResponse({"success": False, "error": "invalid lot"}, status_code=400)
+        sl = float(body["stop_loss"]) if body.get("stop_loss") else None
+        tp = float(body["take_profit"]) if body.get("take_profit") else None
+        entry = float(body["entry_price"]) if body.get("entry_price") else None
+        result = await _do_place_trade_mt5(validated_symbol, side, lot, sl, tp, entry)
+        log_api_call("/api/trade/mt5", "POST", 200)
+        if result.startswith(("Error", "Trade blocked")):
+            return JSONResponse({"success": False, "error": result}, status_code=400)
+        return JSONResponse({"success": True, "data": result})
+    except Exception as e:
+        log_error(e, "api_place_trade_mt5")
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
     finally:
         _current_user_id.reset(ctx_token)
@@ -2201,9 +2332,9 @@ def api_pause_status(request: StarletteRequest) -> JSONResponse:
 
 
 async def _balance_snapshot_loop() -> None:
-    """Periodically refresh the Postgres portfolio balance snapshot via the shared
-    authorized Deriv client. Runs only on the edge bot (one that has DERIV_API_TOKEN)
-    so the token-less in-cluster read-only backend can serve a current balance."""
+    """Periodically refresh the Postgres portfolio balance snapshot via the active
+    broker client. Runs only on the trader bot (DERIV_API_TOKEN edge or BROKER=mt5
+    VPS) so the token-less in-cluster read-only backend can serve a current balance."""
     interval = int(os.getenv("TRADE_MONITOR_INTERVAL", "30"))
     while True:
         await asyncio.sleep(interval)
@@ -2225,9 +2356,9 @@ if __name__ == "__main__":
     if os.getenv("ENABLE_TRADE_MONITOR", "true").lower() == "true":
         loop.run_until_complete(start_trade_monitor())
 
-    # On the authorized (edge) bot, periodically refresh the Postgres balance
-    # snapshot so the token-less read-only backend can serve a current balance.
-    if os.getenv("DERIV_API_TOKEN"):
+    # On the trader bot (Deriv-token edge OR MT5 VPS), periodically refresh the
+    # Postgres balance snapshot so the token-less read-only backend serves it.
+    if os.getenv("DERIV_API_TOKEN") or BROKER == "mt5":
         loop.create_task(_balance_snapshot_loop())
 
     # Handle graceful shutdown

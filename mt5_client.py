@@ -201,6 +201,20 @@ class MT5Client:
         except Exception as e:
             return {"error": {"message": str(e)}}
 
+    async def get_ticks(self, symbol: str) -> Dict[str, Any]:
+        """Latest tick in the Deriv-compatible shape callers expect:
+        {"tick": {"quote", "epoch", "symbol"}}. Uses the live bid."""
+        def _f(mt5):
+            self._select(mt5, symbol)
+            t = mt5.symbol_info_tick(symbol)
+            if t is None:
+                return {"error": {"message": f"no tick for {symbol}"}}
+            return {"tick": {"quote": float(t.bid), "epoch": int(t.time), "symbol": symbol}}
+        try:
+            return await self._call(_f)
+        except Exception as e:
+            return {"error": {"message": str(e)}}
+
     async def get_symbol_spec(self, symbol: str) -> Dict[str, Any]:
         def _f(mt5):
             si = mt5.symbol_info(symbol)
@@ -270,6 +284,33 @@ class MT5Client:
                 })
             return out
         return await self._call(_f)
+
+    async def get_position_close(self, ticket: int) -> Dict[str, Any]:
+        """If position `ticket` is no longer open, return its realized settlement
+        from history deals: {closed, exit_price, profit, closed_at}. Returns
+        {closed: False} while it's still open or no close deal is resolvable yet."""
+        def _f(mt5):
+            import datetime as _dt
+            if mt5.positions_get(ticket=int(ticket)):
+                return {"closed": False}
+            deals = mt5.history_deals_get(position=int(ticket))
+            if not deals:
+                # some builds need an explicit time range alongside position=
+                now = int(_dt.datetime.now().timestamp()) + 3600
+                deals = mt5.history_deals_get(0, now, position=int(ticket))
+            if not deals:
+                return {"closed": False}
+            outs = [d for d in deals if getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT]
+            if not outs:
+                return {"closed": False}
+            last = outs[-1]
+            profit = sum(float(d.profit) for d in outs)
+            return {"closed": True, "exit_price": float(last.price), "profit": profit,
+                    "closed_at": _dt.datetime.utcfromtimestamp(int(last.time))}
+        try:
+            return await self._call(_f)
+        except Exception as e:
+            return {"closed": False, "error": str(e)}
 
     async def close_position(self, ticket: int) -> Dict[str, Any]:
         def _f(mt5):

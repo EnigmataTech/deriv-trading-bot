@@ -27,7 +27,8 @@ def migrate_database():
         'take_profit': 'FLOAT',
         'trailing_stop_distance': 'FLOAT',
         'trailing_stop_price': 'FLOAT',
-        'highest_price_seen': 'FLOAT'
+        'highest_price_seen': 'FLOAT',
+        'mt5_ticket': 'BIGINT'
     }
 
     with engine.connect() as conn:
@@ -61,6 +62,7 @@ class Trade(Base):
     trailing_stop_distance = Column(Float, nullable=True)  # Trailing stop distance in points
     trailing_stop_price = Column(Float, nullable=True)  # Current trailing stop price (moves up)
     highest_price_seen = Column(Float, nullable=True)  # Highest price since trade opened (for trailing)
+    mt5_ticket = Column(Integer, nullable=True, index=True)  # MT5 position/order ticket (BROKER=mt5)
 
 class Portfolio(Base):
     __tablename__ = "portfolios"
@@ -225,7 +227,8 @@ class TradingRepository:
         entry_price: float,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
-        trailing_stop_distance: Optional[float] = None
+        trailing_stop_distance: Optional[float] = None,
+        mt5_ticket: Optional[int] = None
     ) -> Trade:
         """Create a trade with optional SL/TP settings."""
         db = SessionLocal()
@@ -257,7 +260,8 @@ class TradingRepository:
                 take_profit=take_profit,
                 trailing_stop_distance=trailing_stop_distance,
                 trailing_stop_price=trailing_stop_price,
-                highest_price_seen=highest_price_seen
+                highest_price_seen=highest_price_seen,
+                mt5_ticket=mt5_ticket
             )
             db.add(trade)
             db.commit()
