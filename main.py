@@ -2378,10 +2378,19 @@ if __name__ == "__main__":
     if os.getenv("DERIV_API_TOKEN") or BROKER == "mt5":
         loop.create_task(_balance_snapshot_loop())
 
-    # Handle graceful shutdown
+    # Handle graceful shutdown. The server runs inside this loop (uvicorn owns
+    # it), so on SIGTERM the loop is already running — calling run_until_complete
+    # here raises "Cannot run the event loop while another loop is running".
+    # Schedule the cleanup on the live loop instead; exit best-effort.
     def shutdown_handler(signum, frame):
         logger.info("Shutdown signal received")
-        loop.run_until_complete(stop_trade_monitor())
+        try:
+            if loop.is_running():
+                loop.create_task(stop_trade_monitor())
+            else:
+                loop.run_until_complete(stop_trade_monitor())
+        except Exception as e:
+            logger.warning("shutdown cleanup error: %s", e)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown_handler)
