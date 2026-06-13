@@ -1712,8 +1712,25 @@ async def api_sell_contract(request: StarletteRequest) -> JSONResponse:
             pass
         price = body.get("price") if body else None
 
-        # Sell the contract via Deriv API
+        # Close the position (MT5) or sell the contract (Deriv)
         client = await get_deriv_client()
+        if BROKER == "mt5":
+            ticket = int(trade.mt5_ticket or contract_id)
+            res = await client.close_position(ticket)
+            if not res.get("success"):
+                err = res.get("error") or res.get("comment") or f"retcode {res.get('retcode')}"
+                return JSONResponse({"success": False, "error": str(err)}, status_code=500)
+            close = await client.get_position_close(ticket)
+            profit_loss = float(close.get("profit") or 0.0)
+            TradingRepository.update_trade_result(
+                trade_id=contract_id,
+                exit_price=float(close.get("exit_price") or 0.0),
+                profit_loss=profit_loss,
+                status='closed',
+            )
+            log_api_call(f"/api/trade/{contract_id}/sell", "POST", 200)
+            return JSONResponse({"success": True, "data": {
+                "contract_id": contract_id, "ticket": ticket, "profit_loss": profit_loss}})
         try:
             response = await client.sell_contract(contract_id, price)
 
