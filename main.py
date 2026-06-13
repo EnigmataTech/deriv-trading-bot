@@ -2387,8 +2387,9 @@ if __name__ == "__main__":
         try:
             if loop.is_running():
                 loop.create_task(stop_trade_monitor())
-            else:
-                loop.run_until_complete(stop_trade_monitor())
+            # else: the serving loop is anyio-owned and already tearing down;
+            # the monitor task is cancelled with it, so there's nothing to await
+            # here. Avoid run_until_complete — it would raise on the live loop.
         except Exception as e:
             logger.warning("shutdown cleanup error: %s", e)
         sys.exit(0)
