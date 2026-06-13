@@ -1,9 +1,16 @@
 import json
 import math
 import asyncio
-import websockets
-from websockets.protocol import State
-import aiohttp
+try:
+    # The Deriv WS stack is only needed when BROKER=deriv. Under MT5 the bot must
+    # still import this module for TechnicalIndicators (pure math) without it.
+    import websockets
+    from websockets.protocol import State
+    import aiohttp
+except ModuleNotFoundError:  # pragma: no cover - MT5-only deployments
+    websockets = None
+    State = None
+    aiohttp = None
 from typing import Dict, Any, Optional, List
 import os
 from datetime import datetime

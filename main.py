@@ -2363,6 +2363,13 @@ async def _balance_snapshot_loop() -> None:
     while True:
         await asyncio.sleep(interval)
         try:
+            # Replay any writes buffered locally while Postgres was unreachable.
+            replayed = TradingRepository.flush_outbox()
+            if replayed:
+                logger.info("Replayed %d buffered write(s) to Postgres", replayed)
+        except Exception as e:
+            logger.warning("Outbox flush error: %s", e)
+        try:
             await _do_get_balance()
         except Exception as e:
             logger.warning("Balance snapshot loop error: %s", e)

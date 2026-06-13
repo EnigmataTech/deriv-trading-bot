@@ -1,10 +1,26 @@
+import logging
 import os
 from dotenv import load_dotenv
 load_dotenv()
 from sqlalchemy import create_engine, Column, Integer, String, Text, Float, DateTime, Boolean
+from sqlalchemy.exc import OperationalError, InterfaceError, DBAPIError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from typing import List, Optional
 from datetime import datetime
+
+import outbox
+
+logger = logging.getLogger(__name__)
+
+
+def _is_conn_error(exc: Exception) -> bool:
+    """True when a write failed because Postgres was unreachable (so it's worth
+    buffering locally), as opposed to a data/logic error (which should surface)."""
+    if isinstance(exc, (OperationalError, InterfaceError)):
+        return True
+    if isinstance(exc, DBAPIError):
+        return bool(getattr(exc, "connection_invalidated", False))
+    return False
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/trading")
@@ -38,8 +54,13 @@ def migrate_database():
                 conn.commit()
 
 
-# Run migration before create_all
-migrate_database()
+# Run migration before create_all. Tolerate Postgres being unreachable at
+# startup (e.g. tunnel down) so the bot still boots and buffers writes locally;
+# the tables already exist on the long-running cluster Postgres.
+try:
+    migrate_database()
+except Exception as e:
+    logger.warning("Skipping schema migration — Postgres unreachable at startup: %s", e)
 
 class Trade(Base):
     __tablename__ = "trades"
@@ -75,7 +96,10 @@ class Portfolio(Base):
     free_margin = Column(Float, nullable=False, default=0.0)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
-Base.metadata.create_all(bind=engine)
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    logger.warning("Skipping create_all — Postgres unreachable at startup: %s", e)
 
 def get_db():
     db = SessionLocal()
@@ -119,7 +143,25 @@ class TradingRepository:
             db.close()
 
     @staticmethod
-    def update_portfolio(user_id: str, balance: float, equity: float, margin: float, free_margin: float) -> Portfolio:
+    def update_portfolio(user_id: str, balance: float, equity: float, margin: float, free_margin: float) -> Optional[Portfolio]:
+        """Upsert the balance snapshot. Buffers to the outbox if Postgres is
+        unreachable (returns a transient Portfolio in that case)."""
+        try:
+            return TradingRepository._pg_update_portfolio(user_id, balance, equity, margin, free_margin)
+        except Exception as e:
+            if not _is_conn_error(e):
+                raise
+            outbox.enqueue("update_portfolio", {
+                "user_id": user_id, "balance": balance, "equity": equity,
+                "margin": margin, "free_margin": free_margin,
+            })
+            return Portfolio(
+                user_id=user_id, balance=balance, equity=equity,
+                margin=margin, free_margin=free_margin,
+            )
+
+    @staticmethod
+    def _pg_update_portfolio(user_id: str, balance: float, equity: float, margin: float, free_margin: float) -> Portfolio:
         db = SessionLocal()
         try:
             portfolio = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
@@ -145,6 +187,34 @@ class TradingRepository:
             db.close()
 
     @staticmethod
+    def _apply_op(op: str, payload: dict) -> None:
+        """Replay a single buffered op via the raw Postgres writers. Raises on a
+        connection failure so the outbox keeps the op for a later attempt."""
+        if op == "create_trade_with_sl_tp":
+            p = dict(payload)
+            ca = p.pop("created_at", None)
+            p["created_at"] = datetime.fromisoformat(ca) if ca else None
+            TradingRepository._pg_create_trade_with_sl_tp(**p)
+        elif op == "update_trade_result":
+            p = dict(payload)
+            ca = p.pop("closed_at", None)
+            p["closed_at"] = datetime.fromisoformat(ca) if ca else None
+            TradingRepository._pg_update_trade_result(**p)
+        elif op == "update_portfolio":
+            TradingRepository._pg_update_portfolio(**payload)
+        else:
+            logger.error("Outbox: unknown op '%s' — dropping", op)
+
+    @staticmethod
+    def flush_outbox() -> int:
+        """Replay any locally-buffered writes to Postgres. Safe to call often:
+        a no-op when the outbox is empty, and stops early if Postgres is still
+        down. Returns the number of ops replayed."""
+        if outbox.pending_count() == 0:
+            return 0
+        return outbox.replay(TradingRepository._apply_op)
+
+    @staticmethod
     def get_portfolio(user_id: str) -> Optional[Portfolio]:
         db = SessionLocal()
         try:
@@ -166,7 +236,26 @@ class TradingRepository:
 
     @staticmethod
     def update_trade_result(trade_id: str, exit_price: float, profit_loss: float, status: str = 'closed') -> Optional[Trade]:
-        """Update a trade with its final result. Set closed_at to current time."""
+        """Update a trade with its final result. Buffers to the outbox if Postgres
+        is unreachable (returns None in that case)."""
+        try:
+            return TradingRepository._pg_update_trade_result(trade_id, exit_price, profit_loss, status)
+        except Exception as e:
+            if not _is_conn_error(e):
+                raise
+            outbox.enqueue("update_trade_result", {
+                "trade_id": trade_id, "exit_price": exit_price,
+                "profit_loss": profit_loss, "status": status,
+                "closed_at": datetime.utcnow().isoformat(),
+            })
+            return None
+
+    @staticmethod
+    def _pg_update_trade_result(
+        trade_id: str, exit_price: float, profit_loss: float,
+        status: str = 'closed', closed_at: Optional[datetime] = None,
+    ) -> Optional[Trade]:
+        """Update a trade with its final result (raw Postgres write)."""
         db = SessionLocal()
         try:
             trade = db.query(Trade).filter(Trade.trade_id == trade_id).first()
@@ -174,7 +263,7 @@ class TradingRepository:
                 trade.exit_price = exit_price
                 trade.profit_loss = profit_loss
                 trade.status = status
-                trade.closed_at = datetime.utcnow()
+                trade.closed_at = closed_at or datetime.utcnow()
                 db.commit()
                 db.refresh(trade)
             return trade
@@ -229,8 +318,51 @@ class TradingRepository:
         take_profit: Optional[float] = None,
         trailing_stop_distance: Optional[float] = None,
         mt5_ticket: Optional[int] = None
+    ) -> Optional[Trade]:
+        """Create a trade with optional SL/TP settings.
+
+        If Postgres is unreachable the write is buffered to the local outbox and
+        a transient (unpersisted) Trade is returned so callers still see it.
+        """
+        try:
+            return TradingRepository._pg_create_trade_with_sl_tp(
+                user_id=user_id, trade_id=trade_id, symbol=symbol,
+                trade_type=trade_type, amount=amount, entry_price=entry_price,
+                stop_loss=stop_loss, take_profit=take_profit,
+                trailing_stop_distance=trailing_stop_distance, mt5_ticket=mt5_ticket,
+            )
+        except Exception as e:
+            if not _is_conn_error(e):
+                raise
+            outbox.enqueue("create_trade_with_sl_tp", {
+                "user_id": user_id, "trade_id": trade_id, "symbol": symbol,
+                "trade_type": trade_type, "amount": amount, "entry_price": entry_price,
+                "stop_loss": stop_loss, "take_profit": take_profit,
+                "trailing_stop_distance": trailing_stop_distance, "mt5_ticket": mt5_ticket,
+                "created_at": datetime.utcnow().isoformat(),
+            })
+            return Trade(
+                user_id=user_id, trade_id=trade_id, symbol=symbol,
+                trade_type=trade_type, amount=amount, entry_price=entry_price,
+                stop_loss=stop_loss, take_profit=take_profit,
+                trailing_stop_distance=trailing_stop_distance, mt5_ticket=mt5_ticket,
+            )
+
+    @staticmethod
+    def _pg_create_trade_with_sl_tp(
+        user_id: str,
+        trade_id: str,
+        symbol: str,
+        trade_type: str,
+        amount: float,
+        entry_price: float,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        trailing_stop_distance: Optional[float] = None,
+        mt5_ticket: Optional[int] = None,
+        created_at: Optional[datetime] = None,
     ) -> Trade:
-        """Create a trade with optional SL/TP settings."""
+        """Create a trade with optional SL/TP settings (raw Postgres write)."""
         db = SessionLocal()
         try:
             # Check if trade already exists
@@ -263,6 +395,8 @@ class TradingRepository:
                 highest_price_seen=highest_price_seen,
                 mt5_ticket=mt5_ticket
             )
+            if created_at is not None:
+                trade.created_at = created_at
             db.add(trade)
             db.commit()
             db.refresh(trade)

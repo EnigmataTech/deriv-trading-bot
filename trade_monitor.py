@@ -11,7 +11,10 @@ import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
 from contextlib import asynccontextmanager
-from websockets.protocol import State
+try:
+    from websockets.protocol import State  # Deriv path only (BROKER=deriv)
+except ModuleNotFoundError:  # pragma: no cover - MT5-only deployments
+    State = None
 
 from sqlalchemy import or_, and_
 
