@@ -115,6 +115,25 @@ async def api_post(path: str, body: dict | None = None) -> dict[str, Any]:
             return await r.json()
 
 
+# ─── Trade rendering helpers ──────────────────────────────────────────────────
+def is_mt5_trade(t: dict[str, Any]) -> bool:
+    """MT5 trades carry an mt5_ticket and use lot sizing / price-level SL/TP."""
+    return bool(t.get("mt5_ticket"))
+
+
+def direction_text(t: dict[str, Any]) -> Text:
+    """Buy/sell arrow that understands both binary/multiplier and MT5 sides."""
+    direction = (t.get("type") or t.get("trade_type") or "").upper()
+    is_buy = direction in ("MULTUP", "CALL", "BUY")
+    return Text("▲ BUY", style="bold green") if is_buy else Text("▼ SELL", style="bold red")
+
+
+def size_text(t: dict[str, Any]) -> str:
+    """Lot size for MT5 trades (e.g. '0.01'), dollar stake otherwise."""
+    amount = t.get("amount", 0) or 0
+    return f"{amount:.2f}" if is_mt5_trade(t) else f"${amount:.2f}"
+
+
 # ─── Trade Detail Modal ───────────────────────────────────────────────────────
 
 class TradeDetailModal(ModalScreen):
@@ -131,12 +150,14 @@ class TradeDetailModal(ModalScreen):
         pnl_str = (f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}") if pnl is not None else "—"
         is_open = t.get("status", "").lower() == "open"
         is_multiplier = t.get("type", "").upper() in ("MULTUP", "MULTDOWN")
+        is_mt5 = is_mt5_trade(t)
+        size_label = "Lot Size" if is_mt5 else "Amount"
 
         rows = [
             ("Trade ID",       str(t.get("trade_id", "—"))),
             ("Symbol",         t.get("symbol", "—")),
             ("Type",           t.get("type", "—")),
-            ("Amount",         f"${t.get('amount', 0):.2f}"),
+            (size_label,       size_text(t)),
             ("Entry Price",    f"{t.get('entry_price', 0):.5f}"),
             ("Current Price",  f"{t.get('current_price', 0):.5f}" if t.get("current_price") else "—"),
             ("P&L",            pnl_str),
@@ -479,7 +500,7 @@ class DerivTradingApp(App):
         mt.border_title = "Market Watch"
 
         ot = self.query_one("#open-trades-table", DataTable)
-        ot.add_columns("ID", "Symbol", "Dir", "Stake", "Current", "P&L")
+        ot.add_columns("ID", "Symbol", "Dir", "Size", "Current", "P&L")
         ot.border_title = "Open Positions"
 
         st = self.query_one("#signals-table", DataTable)
@@ -487,7 +508,7 @@ class DerivTradingApp(App):
         st.border_title = "Signals  (RSI / MACD / BB → composite)"
 
         ht = self.query_one("#history-table", DataTable)
-        ht.add_columns("ID", "Symbol", "Dir", "Stake", "Entry", "Exit", "P&L", "Closed")
+        ht.add_columns("ID", "Symbol", "Dir", "Size", "Entry", "Exit", "P&L", "Closed")
         ht.border_title = "Trade History"
 
         chart_plot = self.query_one("#chart-plot", PlotextPlot)
@@ -634,11 +655,7 @@ class DerivTradingApp(App):
                         else Text(f"-${abs(pnl):.2f}", style="bold red")
                     ) if pnl is not None else Text("—")
 
-                    direction = t.get("type", "").upper()
-                    dir_text = (
-                        Text("▲ BUY",  style="bold green") if direction in ("MULTUP",  "CALL")
-                        else Text("▼ SELL", style="bold red")
-                    )
+                    dir_text = direction_text(t)
                     symbol = t.get("symbol", "")
                     trade_id = str(t.get("trade_id", t.get("id", "")))
                     short_id = f"…{trade_id[-6:]}"
@@ -648,7 +665,7 @@ class DerivTradingApp(App):
                         short_id,
                         symbol,
                         dir_text,
-                        f"${t.get('amount', 0):.2f}",
+                        size_text(t),
                         f"{current:.2f}" if current else "—",
                         pnl_text,
                         key=trade_id,
@@ -788,11 +805,7 @@ class DerivTradingApp(App):
                     Text(f"+${pnl:.2f}", style="bold green") if pnl >= 0
                     else Text(f"-${abs(pnl):.2f}", style="bold red")
                 ) if pnl is not None else Text("—")
-                direction = t.get("type", t.get("trade_type", "")).upper()
-                dir_text = (
-                    Text("▲ BUY",  style="bold green") if direction in ("MULTUP", "CALL")
-                    else Text("▼ SELL", style="bold red")
-                )
+                dir_text = direction_text(t)
                 symbol = t.get("symbol", "")
                 trade_id = str(t.get("trade_id", t.get("id", "")))
                 closed = t.get("closed_at", "")
@@ -808,7 +821,7 @@ class DerivTradingApp(App):
                     f"…{trade_id[-6:]}",
                     symbol,
                     dir_text,
-                    f"${t.get('amount', 0):.2f}",
+                    size_text(t),
                     entry_str,
                     exit_str,
                     pnl_text,
@@ -839,8 +852,9 @@ class DerivTradingApp(App):
                 ts_raw = t.get("created_at", "")
                 ts = ts_raw[11:16] if len(ts_raw) >= 16 else "--:--"
                 direction = t.get("type", t.get("trade_type", "")).upper()
-                dir_color = "green" if direction == "CALL" else "red"
-                dir_arrow = "▲" if direction == "CALL" else "▼"
+                is_buy = direction in ("MULTUP", "CALL", "BUY")
+                dir_color = "green" if is_buy else "red"
+                dir_arrow = "▲" if is_buy else "▼"
                 pnl = t.get("profit_loss")
                 status = t.get("status", "")
                 if status == "open":
@@ -856,7 +870,7 @@ class DerivTradingApp(App):
                     f"[dim]{ts}[/dim] "
                     f"[{dir_color}]{dir_arrow} {direction}[/{dir_color}] "
                     f"[bold]{symbol}[/bold] "
-                    f"${t.get('amount', 0):.2f} → {result}"
+                    f"{size_text(t)} → {result}"
                 )
         except Exception as e:
             self._log(f"[yellow]Activity feed error: {e}[/yellow]")

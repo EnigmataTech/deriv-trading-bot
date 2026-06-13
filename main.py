@@ -2082,6 +2082,9 @@ def api_trades_list(request: StarletteRequest) -> JSONResponse:
                 "exit_price": trade.exit_price,
                 "profit_loss": trade.profit_loss,
                 "status": trade.status,
+                "stop_loss": trade.stop_loss,
+                "take_profit": trade.take_profit,
+                "mt5_ticket": trade.mt5_ticket,
                 "created_at": trade.created_at.isoformat() if trade.created_at else None,
                 "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
             })
@@ -2107,6 +2110,9 @@ def api_agent_trades(request: StarletteRequest) -> JSONResponse:
                 "exit_price": trade.exit_price,
                 "profit_loss": trade.profit_loss,
                 "status": trade.status,
+                "stop_loss": trade.stop_loss,
+                "take_profit": trade.take_profit,
+                "mt5_ticket": trade.mt5_ticket,
                 "created_at": trade.created_at.isoformat() if trade.created_at else None,
                 "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
             })
@@ -2182,6 +2188,7 @@ async def api_open_trades(request: StarletteRequest) -> JSONResponse:
                     "stop_loss": trade.stop_loss,
                     "take_profit": trade.take_profit,
                     "trailing_stop_price": trade.trailing_stop_price,
+                    "mt5_ticket": trade.mt5_ticket,
                 })
 
             return JSONResponse({
