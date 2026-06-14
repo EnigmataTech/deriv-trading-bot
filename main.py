@@ -21,6 +21,7 @@ from trade_monitor import TradeMonitor
 from jose import jwt
 import os
 import asyncio
+from contextlib import asynccontextmanager
 import time
 import json
 from typing import Optional
@@ -181,7 +182,37 @@ _current_user_id: ContextVar[Optional[str]] = ContextVar("current_user_id", defa
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
 
 # Initialize MCP server (auth handled at REST endpoint level)
-mcp = FastMCP(name="Deriv Trading MCP Server")
+@asynccontextmanager
+async def _app_lifespan(server):
+    """Start the trader's background tasks on the *server's* event loop.
+
+    FastMCP runs this at ASGI app startup (the loop uvicorn actually serves on),
+    so unlike scheduling them on a separately-created loop the trade monitor and
+    balance-snapshot/outbox-flush loop genuinely run. Teardown is cancellation-
+    shielded by FastMCP, so the outbox/monitor get a clean stop on SIGTERM.
+    """
+    bg_tasks = []
+    if os.getenv("ENABLE_TRADE_MONITOR", "true").lower() == "true":
+        try:
+            await start_trade_monitor()
+        except Exception as e:
+            logger.warning("Trade monitor failed to start: %s", e)
+    # On the trader bot (Deriv-token edge OR MT5 VPS), periodically refresh the
+    # Postgres balance snapshot and replay any locally-buffered writes.
+    if os.getenv("DERIV_API_TOKEN") or BROKER == "mt5":
+        bg_tasks.append(asyncio.create_task(_balance_snapshot_loop()))
+    try:
+        yield
+    finally:
+        for t in bg_tasks:
+            t.cancel()
+        try:
+            await stop_trade_monitor()
+        except Exception as e:
+            logger.warning("shutdown cleanup error: %s", e)
+
+
+mcp = FastMCP(name="Deriv Trading MCP Server", lifespan=_app_lifespan)
 
 if AUTH_ENABLED:
     logger.info("Server started with REST authentication enabled")
@@ -2376,41 +2407,11 @@ async def _balance_snapshot_loop() -> None:
 
 
 if __name__ == "__main__":
-    import signal
-    import sys
-
-    # Start trade monitor in background
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    # Start the trade monitor
-    if os.getenv("ENABLE_TRADE_MONITOR", "true").lower() == "true":
-        loop.run_until_complete(start_trade_monitor())
-
-    # On the trader bot (Deriv-token edge OR MT5 VPS), periodically refresh the
-    # Postgres balance snapshot so the token-less read-only backend serves it.
-    if os.getenv("DERIV_API_TOKEN") or BROKER == "mt5":
-        loop.create_task(_balance_snapshot_loop())
-
-    # Handle graceful shutdown. The server runs inside this loop (uvicorn owns
-    # it), so on SIGTERM the loop is already running — calling run_until_complete
-    # here raises "Cannot run the event loop while another loop is running".
-    # Schedule the cleanup on the live loop instead; exit best-effort.
-    def shutdown_handler(signum, frame):
-        logger.info("Shutdown signal received")
-        try:
-            if loop.is_running():
-                loop.create_task(stop_trade_monitor())
-            # else: the serving loop is anyio-owned and already tearing down;
-            # the monitor task is cancelled with it, so there's nothing to await
-            # here. Avoid run_until_complete — it would raise on the live loop.
-        except Exception as e:
-            logger.warning("shutdown cleanup error: %s", e)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
+    # The trade monitor + balance-snapshot/outbox-flush loop are started by
+    # _app_lifespan on the server's event loop (see above). uvicorn owns SIGTERM/
+    # SIGINT and drives the ASGI lifespan shutdown, so no manual loop or signal
+    # handlers are needed here (the old ones ran on an abandoned loop and never
+    # fired the background tasks).
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     logger.info(f"Starting Deriv Trading MCP Server on http://{host}:{port}")
