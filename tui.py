@@ -186,6 +186,11 @@ class TradeDetailModal(ModalScreen):
                         with Horizontal(classes="detail-row"):
                             yield Static(f"{label}:", classes="detail-label")
                             yield Static(value,        classes="detail-value")
+            reason = t.get("reason")
+            if reason:
+                yield Rule()
+                yield Static("Agent reasoning:", classes="detail-label")
+                yield Static(str(reason), id="detail-reason")
             yield Rule()
             with Horizontal(id="modal-buttons"):
                 yield Button("✕  Close Position", id="modal-close-trade", variant="error",
@@ -314,6 +319,7 @@ class DerivTradingApp(App):
     .detail-row    { height: 1; }
     .detail-label  { width: 16; color: $text-muted; content-align: right middle; padding-right: 1; }
     .detail-value  { width: 1fr; }
+    #detail-reason { width: 1fr; color: $text; padding: 0 1; text-style: italic; }
     """
 
     BINDINGS = [
@@ -872,6 +878,9 @@ class DerivTradingApp(App):
                     f"[bold]{symbol}[/bold] "
                     f"{size_text(t)} → {result}"
                 )
+                reason = t.get("reason")
+                if reason:
+                    log.write(f"   [dim italic]↳ {str(reason)[:110]}[/dim italic]")
         except Exception as e:
             self._log(f"[yellow]Activity feed error: {e}[/yellow]")
 
