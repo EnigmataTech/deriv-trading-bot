@@ -193,14 +193,16 @@ async def _app_lifespan(server):
     shielded by FastMCP, so the outbox/monitor get a clean stop on SIGTERM.
     """
     bg_tasks = []
-    if os.getenv("ENABLE_TRADE_MONITOR", "true").lower() == "true":
+    # Only the trader bot (Deriv-token edge OR MT5 VPS) runs the monitor + the
+    # balance-snapshot/outbox-flush loop. The token-less in-cluster read-only
+    # backend skips both (no trades to reconcile; nothing to snapshot).
+    is_trader = bool(os.getenv("DERIV_API_TOKEN")) or BROKER == "mt5"
+    if is_trader and os.getenv("ENABLE_TRADE_MONITOR", "true").lower() == "true":
         try:
             await start_trade_monitor()
         except Exception as e:
             logger.warning("Trade monitor failed to start: %s", e)
-    # On the trader bot (Deriv-token edge OR MT5 VPS), periodically refresh the
-    # Postgres balance snapshot and replay any locally-buffered writes.
-    if os.getenv("DERIV_API_TOKEN") or BROKER == "mt5":
+    if is_trader:
         bg_tasks.append(asyncio.create_task(_balance_snapshot_loop()))
     try:
         yield
