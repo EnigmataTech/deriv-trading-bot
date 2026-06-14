@@ -210,11 +210,16 @@ class TradeMonitor:
                 logger.error("MT5 positions_get failed: %s", e)
                 result["errors"] += 1
                 return result
-            live = {int(p["ticket"]) for p in positions}
+            pos_by_ticket = {int(p["ticket"]): p for p in positions}
             for t in open_trades:
                 result["checked"] += 1
-                if int(t.mt5_ticket) in live:
-                    continue  # still open
+                p = pos_by_ticket.get(int(t.mt5_ticket))
+                if p is not None:
+                    # Still open — refresh live price + floating P&L so the
+                    # read-only cluster backend can serve them to the TUI.
+                    TradingRepository.update_live_price(
+                        t.trade_id, p.get("current_price"), p.get("profit_loss"))
+                    continue
                 try:
                     close = await self.deriv_client.get_position_close(int(t.mt5_ticket))
                     if not close.get("closed"):

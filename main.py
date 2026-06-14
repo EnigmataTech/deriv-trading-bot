@@ -2247,6 +2247,32 @@ async def api_open_trades(request: StarletteRequest) -> JSONResponse:
                 current_price = 0.0
                 entry_price = float(trade.entry_price or 0)
 
+                if trade.mt5_ticket:
+                    # MT5: the VPS monitor refreshes live price + floating P&L into
+                    # the row each cycle; the broker-less cluster just serves them
+                    # (no get_contract_status — that's Deriv-only).
+                    current_price = float(trade.current_price or 0)
+                    unrealized_pnl = float(trade.unrealized_pnl or 0)
+                    total_unrealized_pnl += unrealized_pnl
+                    trade_list.append({
+                        "id": trade.id,
+                        "trade_id": trade.trade_id,
+                        "symbol": trade.symbol,
+                        "type": trade.trade_type.upper(),
+                        "amount": trade.amount,
+                        "entry_price": entry_price,
+                        "current_price": current_price,
+                        "unrealized_pnl": round(unrealized_pnl, 2),
+                        "status": trade.status,
+                        "created_at": trade.created_at.isoformat() if trade.created_at else None,
+                        "stop_loss": trade.stop_loss,
+                        "take_profit": trade.take_profit,
+                        "trailing_stop_price": trade.trailing_stop_price,
+                        "mt5_ticket": trade.mt5_ticket,
+                        "reason": trade.reason,
+                    })
+                    continue
+
                 try:
                     status_resp = await client.get_contract_status(str(trade.trade_id))
                     poc = status_resp.get('proposal_open_contract', {})

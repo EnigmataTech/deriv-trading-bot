@@ -45,7 +45,9 @@ def migrate_database():
         'trailing_stop_price': 'FLOAT',
         'highest_price_seen': 'FLOAT',
         'mt5_ticket': 'BIGINT',
-        'reason': 'TEXT'
+        'reason': 'TEXT',
+        'current_price': 'FLOAT',
+        'unrealized_pnl': 'FLOAT'
     }
 
     with engine.connect() as conn:
@@ -86,6 +88,8 @@ class Trade(Base):
     highest_price_seen = Column(Float, nullable=True)  # Highest price since trade opened (for trailing)
     mt5_ticket = Column(Integer, nullable=True, index=True)  # MT5 position/order ticket (BROKER=mt5)
     reason = Column(Text, nullable=True)  # Agent's stated rationale for the trade (Hermes)
+    current_price = Column(Float, nullable=True)  # Live price, refreshed by the MT5 monitor
+    unrealized_pnl = Column(Float, nullable=True)  # Live floating P&L, refreshed by the MT5 monitor
 
 class Portfolio(Base):
     __tablename__ = "portfolios"
@@ -206,6 +210,26 @@ class TradingRepository:
             TradingRepository._pg_update_portfolio(**payload)
         else:
             logger.error("Outbox: unknown op '%s' — dropping", op)
+
+    @staticmethod
+    def update_live_price(trade_id: str, current_price: float, unrealized_pnl: float) -> None:
+        """Refresh an open trade's live price + floating P&L (best-effort: this is
+        re-written every monitor cycle, so a transient Postgres outage is fine to
+        skip — no outbox buffering)."""
+        try:
+            db = SessionLocal()
+            try:
+                trade = db.query(Trade).filter(Trade.trade_id == trade_id).first()
+                if trade:
+                    trade.current_price = current_price
+                    trade.unrealized_pnl = unrealized_pnl
+                    db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            if not _is_conn_error(e):
+                raise
+            logger.debug("update_live_price skipped (Postgres unreachable): %s", e)
 
     @staticmethod
     def flush_outbox() -> int:
