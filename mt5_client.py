@@ -201,6 +201,26 @@ class MT5Client:
         except Exception as e:
             return {"error": {"message": str(e)}}
 
+    async def get_symbol_specs(self, symbol: str) -> Dict[str, Any]:
+        """Volume constraints for a symbol so callers can size lots correctly
+        (synthetics vary: Vol75=0.01, Vol75(1s)=0.05, Vol100=1.0)."""
+        def _f(mt5):
+            self._select(mt5, symbol)
+            si = mt5.symbol_info(symbol)
+            if si is None:
+                return {"error": {"message": f"no symbol_info for {symbol}"}}
+            return {
+                "symbol": symbol,
+                "volume_min": float(getattr(si, "volume_min", 0.0)),
+                "volume_max": float(getattr(si, "volume_max", 0.0)),
+                "volume_step": float(getattr(si, "volume_step", 0.0)),
+                "trade_allowed": getattr(si, "trade_mode", 0) != 0,
+            }
+        try:
+            return await self._call(_f)
+        except Exception as e:
+            return {"error": {"message": str(e)}}
+
     async def get_ticks(self, symbol: str) -> Dict[str, Any]:
         """Latest tick in the Deriv-compatible shape callers expect:
         {"tick": {"quote", "epoch", "symbol"}}. Uses the live bid."""

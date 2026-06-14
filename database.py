@@ -44,7 +44,8 @@ def migrate_database():
         'trailing_stop_distance': 'FLOAT',
         'trailing_stop_price': 'FLOAT',
         'highest_price_seen': 'FLOAT',
-        'mt5_ticket': 'BIGINT'
+        'mt5_ticket': 'BIGINT',
+        'reason': 'TEXT'
     }
 
     with engine.connect() as conn:
@@ -84,6 +85,7 @@ class Trade(Base):
     trailing_stop_price = Column(Float, nullable=True)  # Current trailing stop price (moves up)
     highest_price_seen = Column(Float, nullable=True)  # Highest price since trade opened (for trailing)
     mt5_ticket = Column(Integer, nullable=True, index=True)  # MT5 position/order ticket (BROKER=mt5)
+    reason = Column(Text, nullable=True)  # Agent's stated rationale for the trade (Hermes)
 
 class Portfolio(Base):
     __tablename__ = "portfolios"
@@ -317,7 +319,8 @@ class TradingRepository:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         trailing_stop_distance: Optional[float] = None,
-        mt5_ticket: Optional[int] = None
+        mt5_ticket: Optional[int] = None,
+        reason: Optional[str] = None
     ) -> Optional[Trade]:
         """Create a trade with optional SL/TP settings.
 
@@ -330,6 +333,7 @@ class TradingRepository:
                 trade_type=trade_type, amount=amount, entry_price=entry_price,
                 stop_loss=stop_loss, take_profit=take_profit,
                 trailing_stop_distance=trailing_stop_distance, mt5_ticket=mt5_ticket,
+                reason=reason,
             )
         except Exception as e:
             if not _is_conn_error(e):
@@ -339,6 +343,7 @@ class TradingRepository:
                 "trade_type": trade_type, "amount": amount, "entry_price": entry_price,
                 "stop_loss": stop_loss, "take_profit": take_profit,
                 "trailing_stop_distance": trailing_stop_distance, "mt5_ticket": mt5_ticket,
+                "reason": reason,
                 "created_at": datetime.utcnow().isoformat(),
             })
             return Trade(
@@ -346,6 +351,7 @@ class TradingRepository:
                 trade_type=trade_type, amount=amount, entry_price=entry_price,
                 stop_loss=stop_loss, take_profit=take_profit,
                 trailing_stop_distance=trailing_stop_distance, mt5_ticket=mt5_ticket,
+                reason=reason,
             )
 
     @staticmethod
@@ -360,6 +366,7 @@ class TradingRepository:
         take_profit: Optional[float] = None,
         trailing_stop_distance: Optional[float] = None,
         mt5_ticket: Optional[int] = None,
+        reason: Optional[str] = None,
         created_at: Optional[datetime] = None,
     ) -> Trade:
         """Create a trade with optional SL/TP settings (raw Postgres write)."""
@@ -393,7 +400,8 @@ class TradingRepository:
                 trailing_stop_distance=trailing_stop_distance,
                 trailing_stop_price=trailing_stop_price,
                 highest_price_seen=highest_price_seen,
-                mt5_ticket=mt5_ticket
+                mt5_ticket=mt5_ticket,
+                reason=reason
             )
             if created_at is not None:
                 trade.created_at = created_at

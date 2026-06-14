@@ -7,6 +7,7 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse, Response, HTMLResponse
 from database import TradingRepository
 from deriv_client import DerivAPIClient, TechnicalIndicators
+from symbols import get_symbol_display_name
 from analytics import (
     ClosedTrade,
     calculate_trade_stats,
@@ -866,8 +867,59 @@ async def get_market_data(symbol: str) -> str:
 
 @mcp.tool()
 async def place_trade(symbol: str, amount: float, direction: str, duration: int = 5) -> str:
-    """Place a binary options trade. Direction: 'CALL' or 'PUT'"""
+    """Place a binary options trade. Direction: 'CALL' or 'PUT'. (Unavailable under
+    MT5 — use place_mt5_trade instead.)"""
     return await _do_place_trade_async(symbol, amount, direction, duration)
+
+@mcp.tool()
+async def get_symbol_specs(symbol: str) -> str:
+    """Volume limits for a symbol so you can size lots correctly (min lot varies:
+    e.g. Volatility 75=0.01, Volatility 75 (1s)=0.05, Volatility 100=1.0).
+    Accepts MT5 names or legacy codes (R_75). MT5 only."""
+    if BROKER != "mt5":
+        return "Error: get_symbol_specs requires BROKER=mt5"
+    name = get_symbol_display_name(symbol)
+    client = await get_deriv_client()
+    s = await client.get_symbol_specs(name)
+    if s.get("error"):
+        return f"Error: {s['error'].get('message')}"
+    return (f"{name}: min_lot={s.get('volume_min')} step={s.get('volume_step')} "
+            f"max_lot={s.get('volume_max')} trade_allowed={s.get('trade_allowed')}")
+
+@mcp.tool()
+async def place_mt5_trade(
+    symbol: str,
+    side: str,
+    lot: float,
+    stop_loss: float = 0.0,
+    take_profit: float = 0.0,
+    reason: str = "",
+) -> str:
+    """Place an MT5 trade (lot-sized, price-level SL/TP).
+
+    Args:
+        symbol: MT5 name ("Volatility 75 Index") or legacy code ("R_75").
+        side: "buy" or "sell" (CALL/MULTUP map to buy; PUT/MULTDOWN to sell).
+        lot: Lot size, e.g. 0.01 (min lot varies per symbol).
+        stop_loss: Optional stop-loss *price* level (0 = none).
+        take_profit: Optional take-profit *price* level (0 = none).
+        reason: Short rationale for the trade — stored with it and shown in the TUI.
+    """
+    if BROKER != "mt5":
+        return "Error: place_mt5_trade requires BROKER=mt5"
+    s = side.strip().lower()
+    if s in ("call", "multup", "buy"):
+        s = "buy"
+    elif s in ("put", "multdown", "sell"):
+        s = "sell"
+    else:
+        return "Error: side must be buy/sell (or CALL/PUT)"
+    return await _do_place_trade_mt5(
+        symbol, s, lot,
+        sl_price=stop_loss or None,
+        tp_price=take_profit or None,
+        reason=reason or None,
+    )
 
 @mcp.tool()
 def get_trade_history() -> str:
@@ -1246,7 +1298,10 @@ def analyze_streak_risk() -> str:
 async def get_market_signal(symbol: str) -> str:
     """Score-based composite BUY/SELL/HOLD call for a symbol.
     Combines RSI, MACD histogram, and Bollinger-band position.
-    Streak-risk pause override forces HOLD when the portfolio is in a danger streak."""
+    Streak-risk pause override forces HOLD when the portfolio is in a danger streak.
+    Accepts MT5 names or legacy Deriv codes (R_75) under BROKER=mt5."""
+    if BROKER == "mt5":
+        symbol = get_symbol_display_name(symbol)  # R_75 -> "Volatility 75 Index"
     client = await get_deriv_client()
     response = await client.get_ticks_history(symbol, count=200)
     if 'error' in response:
@@ -1536,10 +1591,13 @@ async def _do_place_trade_mt5(
     sl_price: Optional[float] = None,
     tp_price: Optional[float] = None,
     entry_price: Optional[float] = None,
+    reason: Optional[str] = None,
 ) -> str:
     """Place an MT5-native order: lot size + price-level SL/TP (+ optional pending
     entry). Persists trade_id=str(ticket) and the typed mt5_ticket so the monitor
-    can reconcile against positions_get()."""
+    can reconcile against positions_get(). Accepts either MT5 names ("Volatility
+    75 Index") or legacy Deriv codes ("R_75"), and an optional agent rationale."""
+    symbol = get_symbol_display_name(symbol)  # R_75 -> "Volatility 75 Index"; passthrough otherwise
     user_id = get_user_id()
     can_trade, limit_error = check_daily_loss_limit(user_id)
     if not can_trade:
@@ -1552,6 +1610,14 @@ async def _do_place_trade_mt5(
         return "Error: side must be 'buy' or 'sell'"
 
     client = await get_deriv_client()  # MT5Client when BROKER=mt5
+    # Validate lot against the symbol's volume constraints so the agent gets a
+    # clear message instead of MT5's bare "Invalid volume" (min lot varies:
+    # Vol75=0.01, Vol75(1s)=0.05, Vol100=1.0).
+    specs = await client.get_symbol_specs(symbol)
+    vmin = specs.get("volume_min") or 0
+    if vmin and lot < vmin:
+        return (f"Error: lot {lot} below min {vmin} for {symbol} "
+                f"(step {specs.get('volume_step')}, max {specs.get('volume_max')})")
     res = await client.place_order(symbol, side, lot, sl_price=sl_price,
                                    tp_price=tp_price, entry_price=entry_price)
     if not res.get("success"):
@@ -1574,6 +1640,7 @@ async def _do_place_trade_mt5(
         user_id=user_id, trade_id=str(ticket), symbol=symbol,
         trade_type=side, amount=float(lot), entry_price=fill,
         stop_loss=sl_price, take_profit=tp_price, mt5_ticket=int(ticket) if ticket else None,
+        reason=reason,
     )
     log_trade_placed(symbol=symbol, amount=lot, direction=side.upper(),
                      contract_type="MT5", duration=0, trade_id=str(ticket))
@@ -1662,7 +1729,8 @@ async def api_place_trade_mt5(request: StarletteRequest) -> JSONResponse:
         sl = float(body["stop_loss"]) if body.get("stop_loss") else None
         tp = float(body["take_profit"]) if body.get("take_profit") else None
         entry = float(body["entry_price"]) if body.get("entry_price") else None
-        result = await _do_place_trade_mt5(validated_symbol, side, lot, sl, tp, entry)
+        reason = (str(body.get("reason")).strip() or None) if body.get("reason") else None
+        result = await _do_place_trade_mt5(validated_symbol, side, lot, sl, tp, entry, reason=reason)
         log_api_call("/api/trade/mt5", "POST", 200)
         if result.startswith(("Error", "Trade blocked")):
             return JSONResponse({"success": False, "error": result}, status_code=400)
@@ -2116,6 +2184,7 @@ def api_trades_list(request: StarletteRequest) -> JSONResponse:
                 "stop_loss": trade.stop_loss,
                 "take_profit": trade.take_profit,
                 "mt5_ticket": trade.mt5_ticket,
+                "reason": trade.reason,
                 "created_at": trade.created_at.isoformat() if trade.created_at else None,
                 "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
             })
@@ -2144,6 +2213,7 @@ def api_agent_trades(request: StarletteRequest) -> JSONResponse:
                 "stop_loss": trade.stop_loss,
                 "take_profit": trade.take_profit,
                 "mt5_ticket": trade.mt5_ticket,
+                "reason": trade.reason,
                 "created_at": trade.created_at.isoformat() if trade.created_at else None,
                 "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
             })
@@ -2220,6 +2290,7 @@ async def api_open_trades(request: StarletteRequest) -> JSONResponse:
                     "take_profit": trade.take_profit,
                     "trailing_stop_price": trade.trailing_stop_price,
                     "mt5_ticket": trade.mt5_ticket,
+                    "reason": trade.reason,
                 })
 
             return JSONResponse({
