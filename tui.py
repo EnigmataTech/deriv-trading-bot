@@ -685,10 +685,13 @@ class DerivTradingApp(App):
             stats_resp = await api_get("/api/trades/summary")
             if stats_resp.get("success"):
                 s = stats_resp.get("data", {})
-                sign = "+" if total_pnl >= 0 else ""
+                pnl_disp = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+                realized = s.get("total_profit_loss", 0) or 0
+                realized_disp = f"+${realized:.2f}" if realized >= 0 else f"-${abs(realized):.2f}"
                 self.query_one("#portfolio-panel", Static).update(
                     f"Trades: {s.get('total_trades', 0)}  Win Rate: {s.get('win_rate', 0):.1f}%\n"
-                    f"Open: {s.get('open_trades', 0)}  Unrealized P&L: {sign}${total_pnl:.2f}"
+                    f"Open: {s.get('open_trades', 0)}  Unrealized P&L: {pnl_disp}\n"
+                    f"Closed: {s.get('closed_trades', 0)}  Realized P&L: {realized_disp}"
                 )
 
             self._update_subtitle(len(trades))
