@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import sys
+import bisect
 from datetime import datetime, timezone
 from typing import Optional, Any
 
@@ -350,9 +351,9 @@ class DerivTradingApp(App):
         Binding("a", "toggle_auto_refresh", "Auto"),
         Binding("ctrl+l", "clear_log",      "Clear Log"),
         Binding("escape", "deselect",       "Deselect", show=False),
-        Binding("[", "chart_pan(-1)",       "Chart ◀", show=False),
-        Binding("]", "chart_pan(1)",        "Chart ▶", show=False),
-        Binding("\\", "chart_pan(0)",       "Chart live", show=False),
+        Binding("[", "chart_pan(-1)",       "Chart ◀", show=False, priority=True),
+        Binding("]", "chart_pan(1)",        "Chart ▶", show=False, priority=True),
+        Binding("\\", "chart_pan(0)",       "Chart live", show=False, priority=True),
         Binding("q", "quit",                "Quit"),
         Binding("j", "scroll_down_table",   "↓", show=False),
         Binding("k", "scroll_up_table",     "↑", show=False),
@@ -985,8 +986,20 @@ class DerivTradingApp(App):
             # coordinates (scatter markers don't render dependably).
             t0, t1 = times[0], times[-1]
             last = data["Close"][-1]
-            entries: list[tuple] = []   # (datetime, price, glyph, color)
-            exits: list[tuple] = []     # (datetime, price, color)
+            n = len(times)
+
+            def idx_of(ts):
+                """Nearest candle index for a timestamp — markers sit on the
+                evenly-spaced candle slots (not a datetime axis)."""
+                j = bisect.bisect_left(times, ts)
+                if j <= 0:
+                    return 0
+                if j >= n:
+                    return n - 1
+                return j if (times[j] - ts) <= (ts - times[j - 1]) else j - 1
+
+            entries: list[tuple] = []   # (x_index, price, glyph, color)
+            exits: list[tuple] = []     # (x_index, price, color)
             open_lines: list[float] = []
             n_open = n_closed = off_screen = sym_trades = 0
             recent_summary: Optional[str] = None
@@ -1006,7 +1019,7 @@ class DerivTradingApp(App):
                         ep = float(ep)
                         is_up = str(t.get("type", "")).lower() in ("call", "buy", "multup")
                         sign = 1 if is_up else -1
-                        entries.append((ca, ep, "▲" if is_up else "▼", "green" if is_up else "red"))
+                        entries.append((idx_of(ca), ep, "▲" if is_up else "▼", "green" if is_up else "red"))
                         if t.get("status") == "open":
                             n_open += 1
                             open_lines.append(ep)
@@ -1018,7 +1031,7 @@ class DerivTradingApp(App):
                             if xp:
                                 xp = float(xp)
                                 if cl and t0 <= cl <= t1:
-                                    exits.append((cl, xp, "green" if (pnl or 0) >= 0 else "red"))
+                                    exits.append((idx_of(cl), xp, "green" if (pnl or 0) >= 0 else "red"))
                                 pnl_s = f"${pnl:+.2f}" if pnl is not None else "?"
                                 recent_summary = f"{'▲' if is_up else '▼'} {(xp - ep) * sign:+.2f} pts → {pnl_s}"
             except Exception:
@@ -1026,15 +1039,23 @@ class DerivTradingApp(App):
 
             plt = plot.plt
             plt.clear_figure()
-            plt.date_form("H:M")
-            plt.candlestick([plt.datetime_to_string(t) for t in times], data)
+            # Plot candles at even integer slots (not a datetime axis) so spacing
+            # is uniform on every timeframe — plotext's datetime mode rounds to
+            # columns and leaves gaps ("scatter"), worst on sparse 1h data.
+            xs = list(range(n))
+            plt.candlestick(xs, data)
             plt.horizontal_line(last, color="orange")           # live current price
             for y in open_lines:                                 # open-position entry price
                 plt.horizontal_line(y, color="cyan")
-            for ca, price, glyph, color in entries:              # entry arrows at entry price
-                plt.text(glyph, plt.datetime_to_string(ca), price, color=color)
-            for cl, price, color in exits:                       # exit markers at exit price
-                plt.text("●", plt.datetime_to_string(cl), price, color=color)
+            for x, price, glyph, color in entries:               # entry arrows at entry price
+                plt.text(glyph, x, price, color=color)
+            for x, price, color in exits:                        # exit markers at exit price
+                plt.text("●", x, price, color=color)
+            # Time labels at ~6 evenly-spaced candle slots.
+            if n:
+                step = max(1, n // 6)
+                ticks = list(range(0, n, step))
+                plt.xticks(ticks, [times[i].strftime("%H:%M") for i in ticks])
             plt.title(f"{symbol} · {tf}")
             plot.refresh()
 
