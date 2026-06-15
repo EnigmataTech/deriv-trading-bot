@@ -2588,20 +2588,7 @@ async def _balance_snapshot_loop() -> None:
             logger.warning("Balance snapshot loop error: %s", e)
 
 
-def _notify_telegram(text: str) -> None:
-    """Best-effort Telegram ping (stdlib only — no extra deps). Configured via
-    TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID; silently no-op if unset."""
-    tok = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat = os.getenv("TELEGRAM_CHAT_ID")
-    if not (tok and chat):
-        return
-    try:
-        import urllib.request, urllib.parse
-        data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
-        req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=data)
-        urllib.request.urlopen(req, timeout=10).read()
-    except Exception as e:
-        logger.warning("Telegram notify failed: %s", e)
+from notify import notify_telegram as _notify_telegram  # shared stdlib Telegram notifier
 
 
 async def _autotrade_loop() -> None:

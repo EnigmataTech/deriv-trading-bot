@@ -20,6 +20,7 @@ from sqlalchemy import or_, and_
 
 from deriv_client import DerivAPIClient
 from database import Trade, SessionLocal, TradingRepository
+from notify import notify_telegram
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -230,6 +231,17 @@ class TradeMonitor:
                         "closed_at": close.get("closed_at") or datetime.utcnow(),
                     })
                     result["closed"] += 1
+                    try:
+                        pnl = float(close.get("profit") or 0.0)
+                        emoji = "🟢" if pnl >= 0 else "🔴"
+                        outcome = "profit" if pnl >= 0 else "loss"
+                        await asyncio.to_thread(
+                            notify_telegram,
+                            f"{emoji} Closed {t.symbol} {str(t.trade_type).upper()} "
+                            f"#{t.mt5_ticket} | exit {close.get('exit_price')} | "
+                            f"P&L ${pnl:+.2f} ({outcome})")
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.error("MT5 reconcile error for ticket %s: %s", t.mt5_ticket, e)
                     result["errors"] += 1

@@ -252,6 +252,8 @@ class DerivTradingApp(App):
     DataTable:focus > .datatable--cursor { background: $primary 30%; }
     DataTable > .datatable--cursor       { background: transparent; }
 
+    #edge-panel { width: 66; padding: 0 1; }
+
     /* ── Market table ──────────────────────── */
     #market-table { height: 10; }
 
@@ -489,7 +491,10 @@ class DerivTradingApp(App):
 
             # ── History ────────────────────────────────────────────────────
             with TabPane("History  [3]", id="tab-history"):
-                yield DataTable(id="history-table")
+                with Horizontal(id="history-split"):
+                    yield DataTable(id="history-table")
+                    yield Static("Edge analysis loading…", id="edge-panel",
+                                 classes="panel", markup=False)
 
             # ── Chart ──────────────────────────────────────────────────────
             with TabPane("Chart  [4]", id="tab-chart"):
@@ -541,6 +546,7 @@ class DerivTradingApp(App):
         ht = self.query_one("#history-table", DataTable)
         ht.add_columns("ID", "Symbol", "Dir", "Size", "Entry", "Exit", "P&L", "Closed")
         ht.border_title = "Trade History"
+        self.query_one("#edge-panel", Static).border_title = "Signal Edge"
 
         chart_plot = self.query_one("#chart-plot", PlotextPlot)
         chart_plot.border_title = "Candlestick Chart"
@@ -582,12 +588,14 @@ class DerivTradingApp(App):
         await self._fetch_agent_activity()
         await self._fetch_history()
         await self._fetch_signals()
+        await self._fetch_edge()
 
         self._timer_ticks   = self.set_interval(1,  self.refresh_ticks)
         self._timer_balance = self.set_interval(30, self.refresh_balance)
         self._timer_open    = self.set_interval(3,  self.refresh_open_trades)
         self._timer_market  = self.set_interval(5, self.refresh_market_data)
         self._timer_history = self.set_interval(15, self.refresh_history)
+        self._timer_edge    = self.set_interval(20, self.refresh_edge)
         self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
         self._timer_signals = self.set_interval(3, self.refresh_signals)
         self._timer_chart   = self.set_interval(2, self.refresh_chart)
@@ -869,6 +877,22 @@ class DerivTradingApp(App):
     @work(exclusive=True, group="history")
     async def refresh_history(self) -> None:
         await self._fetch_history()
+
+    async def _fetch_edge(self) -> None:
+        try:
+            resp = await api_get("/api/analysis/edge")
+            panel = self.query_one("#edge-panel", Static)
+            panel.update(resp.get("report", "no data") if resp.get("success")
+                         else "Edge analysis unavailable")
+        except Exception as e:
+            try:
+                self.query_one("#edge-panel", Static).update(f"Edge error: {e}")
+            except Exception:
+                pass
+
+    @work(exclusive=True, group="edge")
+    async def refresh_edge(self) -> None:
+        await self._fetch_edge()
 
     async def _fetch_agent_activity(self) -> None:
         try:
@@ -1517,6 +1541,7 @@ class DerivTradingApp(App):
             self._timer_open    = self.set_interval(3,  self.refresh_open_trades)
             self._timer_market  = self.set_interval(5, self.refresh_market_data)
             self._timer_history = self.set_interval(15, self.refresh_history)
+            self._timer_edge    = self.set_interval(20, self.refresh_edge)
             self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
             self._timer_chart   = self.set_interval(2, self.refresh_chart)
             self._log("[green]Auto-refresh ON[/green]")
