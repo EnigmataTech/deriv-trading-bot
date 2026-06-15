@@ -215,6 +215,8 @@ class MT5Client:
                 "volume_max": float(getattr(si, "volume_max", 0.0)),
                 "volume_step": float(getattr(si, "volume_step", 0.0)),
                 "digits": int(getattr(si, "digits", 2)),
+                "point": float(getattr(si, "point", 0.0)),
+                "stops_level": int(getattr(si, "trade_stops_level", 0)),
                 "trade_allowed": getattr(si, "trade_mode", 0) != 0,
             }
         try:

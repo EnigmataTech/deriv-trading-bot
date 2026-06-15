@@ -1209,6 +1209,86 @@ def get_per_symbol_performance() -> str:
     return "\n".join(lines)
 
 
+def _signal_edge_report() -> str:
+    """Win rate + expectancy bucketed by the autotrader's entry signal, so the
+    data shows whether the signal actually beats a random baseline."""
+    import re
+    from collections import defaultdict
+    user_id = get_user_id()
+    trades = [t for t in TradingRepository.get_trades_by_user(user_id)
+              if t.status == "closed" and t.profit_loss is not None]
+    if not trades:
+        return "No closed trades to analyse yet — let the autotrader gather some."
+
+    def is_spike(t):
+        return bool(t.reason and "spike" in t.reason.lower())
+
+    def bucket(t):
+        m = re.search(r"score\s*([+-]?\d+)", t.reason or "")
+        if m:
+            return f"score {int(m.group(1)):+d}"
+        return "spike" if is_spike(t) else "manual/other"
+
+    def stats(pnls):
+        n = len(pnls)
+        wins = [p for p in pnls if p > 0]
+        gl = -sum(p for p in pnls if p <= 0)
+        wr = len(wins) / n * 100 if n else 0.0
+        exp = sum(pnls) / n if n else 0.0
+        pf = (sum(wins) / gl) if gl > 0 else float("inf")
+        return n, wr, exp, sum(pnls), pf
+
+    groups = defaultdict(list)
+    for t in trades:
+        groups[bucket(t)].append(float(t.profit_loss))
+
+    lines = ["=== Signal Edge Analysis ===",
+             "(expectancy = avg P&L per trade; >0 after spread ⇒ real edge)", ""]
+    n, wr, exp, tot, pf = stats([float(t.profit_loss) for t in trades])
+    lines.append(f"ALL: {n} trades | win {wr:.1f}% | exp ${exp:+.3f} | total ${tot:+.2f} | PF {pf:.2f}")
+
+    def order(k):
+        m = re.search(r"([+-]?\d+)", k)
+        return int(m.group(1)) if m else 999
+    lines += ["", "By entry signal:"]
+    for k in sorted(groups, key=order):
+        n, wr, exp, tot, pf = stats(groups[k])
+        lines.append(f"  {k:>12}: {n:>3} | win {wr:5.1f}% | exp ${exp:+.3f} | tot ${tot:+.2f} | PF {pf:.2f}")
+
+    spike = [float(t.profit_loss) for t in trades if is_spike(t)]
+    vol = [float(t.profit_loss) for t in trades if not is_spike(t)]
+    lines.append("")
+    if spike:
+        n, wr, exp, tot, pf = stats(spike)
+        lines.append(f"Crash/Boom (spike): {n} | win {wr:.1f}% | exp ${exp:+.3f} | PF {pf:.2f}")
+    if vol:
+        n, wr, exp, tot, pf = stats(vol)
+        lines.append(f"Volatility (signal): {n} | win {wr:.1f}% | exp ${exp:+.3f} | PF {pf:.2f}")
+    lines += ["",
+              "Read: if expectancy climbs with |score|, the signal has edge. If it's flat or",
+              "negative across buckets, entries are ~random (the expected result on RNG vol",
+              "indices) — profit then depends on finding a structurally biased instrument."]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def analyze_signal_edge() -> str:
+    """Measure whether the entry signal has real predictive edge: win rate and
+    expectancy bucketed by the autotrader's composite score (and Crash/Boom spike
+    entries), versus a random baseline. Use this to decide what to scale."""
+    return _signal_edge_report()
+
+
+@mcp.custom_route("/api/analysis/edge", methods=["GET"])
+def api_analysis_edge(request: StarletteRequest) -> JSONResponse:
+    """No-auth edge report (the TUI reads this). Scoped to the agent's trades."""
+    try:
+        return JSONResponse({"success": True, "report": _signal_edge_report()})
+    except Exception as e:
+        log_error(e, "api_analysis_edge")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 @mcp.tool()
 def analyze_trade_quality() -> str:
     """Analyse trade quality via duration distribution.
@@ -2536,6 +2616,7 @@ async def _autotrade_loop() -> None:
     max_lot = float(os.getenv("AUTOTRADE_MAX_LOT", "1.0"))
     sl_mult = float(os.getenv("AUTOTRADE_SL_MULT", "1.0"))      # stop = sl_mult × stdev(recent prices); 0 disables SL/TP
     rr = float(os.getenv("AUTOTRADE_RR", "1.5"))               # target = rr × stop distance
+    spike_rr = float(os.getenv("AUTOTRADE_SPIKE_RR", "4.0"))    # wider target for Crash/Boom spike entries
     sl_floor_pct = float(os.getenv("AUTOTRADE_SL_FLOOR_PCT", "0.002"))  # min stop as % of price
     symbols = [s.strip() for s in os.getenv(
         "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V").split(",") if s.strip()]
@@ -2558,15 +2639,27 @@ async def _autotrade_loop() -> None:
                           if "error" not in resp else [])
                 if len(prices) < 35:
                     continue
-                sig = _compute_market_signal(name, prices)
-                score = sig.get("composite_score", 0)
-                if abs(score) < threshold:
-                    continue
+                lname = name.lower()
+                is_spike = "crash" in lname or "boom" in lname
+                if is_spike:
+                    # Structural bias: Boom only spikes UP, Crash only spikes DOWN.
+                    # Trade in the spike direction (positive skew: small drift
+                    # losses, occasional large spike win). No TA score.
+                    side = "buy" if "boom" in lname else "sell"
+                    eff_rr = spike_rr
+                    entry_label = "spike"
+                else:
+                    sig = _compute_market_signal(name, prices)
+                    score = sig.get("composite_score", 0)
+                    if abs(score) < threshold:
+                        continue
+                    side = "buy" if score > 0 else "sell"
+                    eff_rr = rr
+                    entry_label = f"score {score:+d}: {sig.get('reason', '')}"
                 specs = await client.get_symbol_specs(name)
                 lot = specs.get("volume_min") or 0
                 if not lot or lot > max_lot:
                     continue  # skip symbols whose min lot is too large
-                side = "buy" if score > 0 else "sell"
 
                 # Risk management: stop sized from recent price volatility (stdev)
                 # with a % floor so MT5 doesn't reject it as too tight; target =
@@ -2576,16 +2669,20 @@ async def _autotrade_loop() -> None:
                     window = prices[-30:]
                     vol = statistics.pstdev(window) if len(window) >= 5 else 0.0
                     entry = prices[-1]
-                    dist = max(sl_mult * vol, sl_floor_pct * entry)
+                    # Floor the stop above (a) a % of price and (b) MT5's min
+                    # stop distance for this symbol, so low-priced symbols don't
+                    # get their stops rejected (which would leave them unprotected).
+                    min_stop = specs.get("stops_level", 0) * specs.get("point", 0.0)
+                    dist = max(sl_mult * vol, sl_floor_pct * entry, min_stop * 1.5)
                     digits = int(specs.get("digits", 2))
                     if side == "buy":
                         sl_price = round(entry - dist, digits)
-                        tp_price = round(entry + rr * dist, digits)
+                        tp_price = round(entry + eff_rr * dist, digits)
                     else:
                         sl_price = round(entry + dist, digits)
-                        tp_price = round(entry - rr * dist, digits)
+                        tp_price = round(entry - eff_rr * dist, digits)
 
-                reason = f"auto score {score:+d}: {sig.get('reason', '')}"
+                reason = f"auto {entry_label}"
                 result = await _do_place_trade_mt5(
                     name, side, lot, sl_price=sl_price, tp_price=tp_price, reason=reason)
                 # If MT5 rejected the stops as invalid, retry once without SL/TP
