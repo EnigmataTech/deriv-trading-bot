@@ -41,7 +41,7 @@ from textual import work
 from textual_plotext import PlotextPlot
 
 from logger import setup_logging
-from symbols import get_short_name
+from symbols import get_short_name, get_symbol_display_name
 
 load_dotenv()
 
@@ -350,6 +350,9 @@ class DerivTradingApp(App):
         Binding("a", "toggle_auto_refresh", "Auto"),
         Binding("ctrl+l", "clear_log",      "Clear Log"),
         Binding("escape", "deselect",       "Deselect", show=False),
+        Binding("[", "chart_pan(-1)",       "Chart ◀", show=False),
+        Binding("]", "chart_pan(1)",        "Chart ▶", show=False),
+        Binding("\\", "chart_pan(0)",       "Chart live", show=False),
         Binding("q", "quit",                "Quit"),
         Binding("j", "scroll_down_table",   "↓", show=False),
         Binding("k", "scroll_up_table",     "↑", show=False),
@@ -377,6 +380,7 @@ class DerivTradingApp(App):
         self._timer_signals: Optional[Timer] = None
         self._chart_symbol: str = "R_100"
         self._chart_tf: str = "1m"
+        self._chart_offset: int = 0     # candles scrolled back from the latest (0 = live edge)
         self._timer_chart: Optional[Timer] = None
 
     # ─── Layout ──────────────────────────────────────────────────────────────
@@ -503,6 +507,7 @@ class DerivTradingApp(App):
                         value=self._chart_tf,
                         allow_blank=False,
                     )
+                    yield Static("   [dim]◀ [ · ] ▶ · \\ live[/dim]", id="chart-nav-hint")
                 yield PlotextPlot(id="chart-plot", classes="panel")
                 yield Static("Chart: idle", id="chart-status")
 
@@ -923,9 +928,13 @@ class DerivTradingApp(App):
 
     @staticmethod
     def _parse_iso(s: str) -> Optional[datetime]:
-        """Parse an API ISO timestamp into a naive-UTC datetime (to match candle epochs)."""
+        """Parse an API ISO timestamp (naive UTC) into a *local* naive datetime,
+        so trade markers align with the locally-rendered candle times."""
         try:
-            return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+            dt = datetime.fromisoformat(s.replace("Z", ""))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone().replace(tzinfo=None)
         except Exception:
             return None
 
@@ -935,7 +944,8 @@ class DerivTradingApp(App):
         status = self.query_one("#chart-status", Static)
         plot = self.query_one("#chart-plot", PlotextPlot)
         try:
-            resp = await api_get(f"/api/candles/{symbol}?timeframe={tf}&count=120")
+            # Fetch a deep history so the user can pan back through it.
+            resp = await api_get(f"/api/candles/{symbol}?timeframe={tf}&count=500")
             if not resp.get("success"):
                 status.update(f"[red]Chart: candles unavailable for {symbol}[/red]")
                 return
@@ -945,16 +955,21 @@ class DerivTradingApp(App):
                 status.update(f"[yellow]Chart: no candle data for {symbol}[/yellow]")
                 return
 
-            # Cap candle count to what fits the plot width with even spacing.
+            # Cap visible candles to what fits the plot width with even spacing.
             # Plotting more candles than available columns makes plotext squash
             # some together (they look paired); ~2 columns per candle keeps gaps
             # even. The y-axis labels eat ~8 columns.
             width = plot.size.width or 120
             max_candles = max(20, (width - 8) // 2)
-            if len(candles) > max_candles:
-                candles = candles[-max_candles:]
+            # Window = a max_candles-wide slice positioned by the pan offset
+            # (0 = live edge). Clamp the offset to the available history.
+            total = len(candles)
+            self._chart_offset = max(0, min(self._chart_offset, max(0, total - max_candles)))
+            end = total - self._chart_offset
+            start = max(0, end - max_candles)
+            candles = candles[start:end]
 
-            times = [datetime.fromtimestamp(int(c["time"]), timezone.utc).replace(tzinfo=None)
+            times = [datetime.fromtimestamp(int(c["time"]))  # local naive (matches _parse_iso)
                      for c in candles]
             data = {
                 "Open":  [float(c["open"])  for c in candles],
@@ -978,8 +993,9 @@ class DerivTradingApp(App):
             try:
                 tr = await api_get("/api/trades/agent")
                 if tr.get("success"):
+                    chart_name = get_symbol_display_name(symbol)  # R_75 -> "Volatility 75 Index"
                     for t in sorted(tr.get("trades", []), key=lambda x: x.get("created_at") or ""):
-                        if t.get("symbol") != symbol:
+                        if t.get("symbol") not in (symbol, chart_name):
                             continue
                         sym_trades += 1
                         ca = self._parse_iso(t.get("created_at") or "")
@@ -1023,6 +1039,8 @@ class DerivTradingApp(App):
             plot.refresh()
 
             parts = [f"{symbol} {tf}", f"last {last:.5f}"]
+            if self._chart_offset > 0:
+                parts.append(f"◀ history −{self._chart_offset} ( ] forward · \\ live )")
             if n_open or n_closed:
                 parts.append(f"▲▼ {n_open} open / {n_closed} closed ●")
             if recent_summary:
@@ -1389,9 +1407,11 @@ class DerivTradingApp(App):
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "chart-symbol" and event.value is not Select.BLANK:
             self._chart_symbol = str(event.value)
+            self._chart_offset = 0
             self.refresh_chart()
         elif event.select.id == "chart-tf" and event.value is not Select.BLANK:
             self._chart_tf = str(event.value)
+            self._chart_offset = 0
             self.refresh_chart()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -1450,6 +1470,21 @@ class DerivTradingApp(App):
             self.screen.set_focus(None)
         except Exception:
             pass
+
+    def action_chart_pan(self, direction: int) -> None:
+        """Pan the chart through history: [ = older, ] = newer, \\ = back to live.
+        Pans by half a screen so context is kept. direction 0 resets to the edge."""
+        if direction == 0:
+            self._chart_offset = 0
+        else:
+            try:
+                width = self.query_one("#chart-plot", PlotextPlot).size.width or 120
+            except Exception:
+                width = 120
+            step = max(5, (max(20, (width - 8) // 2)) // 2)
+            # [ (direction -1) pans back into history (offset up); ] pans forward.
+            self._chart_offset = max(0, self._chart_offset - direction * step)
+        self.refresh_chart()
 
     def action_toggle_auto_refresh(self) -> None:
         self._auto_refresh = not self._auto_refresh
