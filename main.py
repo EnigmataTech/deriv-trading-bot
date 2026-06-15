@@ -204,6 +204,8 @@ async def _app_lifespan(server):
             logger.warning("Trade monitor failed to start: %s", e)
     if is_trader:
         bg_tasks.append(asyncio.create_task(_balance_snapshot_loop()))
+        # Deterministic no-LLM autotrader (self-gates on AUTOTRADE_ENABLED).
+        bg_tasks.append(asyncio.create_task(_autotrade_loop()))
     try:
         yield
     finally:
@@ -2503,6 +2505,74 @@ async def _balance_snapshot_loop() -> None:
             await _do_get_balance()
         except Exception as e:
             logger.warning("Balance snapshot loop error: %s", e)
+
+
+def _notify_telegram(text: str) -> None:
+    """Best-effort Telegram ping (stdlib only — no extra deps). Configured via
+    TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID; silently no-op if unset."""
+    tok = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    if not (tok and chat):
+        return
+    try:
+        import urllib.request, urllib.parse
+        data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+        req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        logger.warning("Telegram notify failed: %s", e)
+
+
+async def _autotrade_loop() -> None:
+    """Deterministic (no-LLM) autotrader. Scans configured symbols on an interval,
+    places a min-lot MT5 trade when |composite_score| >= threshold (reusing the
+    same scoring as get_market_signal), and pings Telegram ONLY on a real entry.
+    Zero LLM tokens. Gated by AUTOTRADE_ENABLED; MT5 only."""
+    if BROKER != "mt5" or os.getenv("AUTOTRADE_ENABLED", "false").lower() != "true":
+        return
+    interval = int(os.getenv("AUTOTRADE_INTERVAL", "60"))
+    threshold = int(os.getenv("AUTOTRADE_THRESHOLD", "2"))
+    max_lot = float(os.getenv("AUTOTRADE_MAX_LOT", "1.0"))
+    symbols = [s.strip() for s in os.getenv(
+        "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V").split(",") if s.strip()]
+    logger.info("Autotrader ON: every %ds, threshold ±%d, max_lot %s, symbols %s",
+                interval, threshold, max_lot, symbols)
+    await asyncio.sleep(10)  # let the bridge/monitor settle after startup
+    while True:
+        try:
+            client = await get_deriv_client()
+            try:
+                open_syms = {p.get("symbol") for p in (await client.get_open_positions() or [])}
+            except Exception:
+                open_syms = set()
+            for code in symbols:
+                name = get_symbol_display_name(code)
+                if name in open_syms:
+                    continue  # one position per symbol — don't stack
+                resp = await client.get_ticks_history(name, count=200)
+                prices = ([float(p) for p in resp.get("history", {}).get("prices", [])]
+                          if "error" not in resp else [])
+                if len(prices) < 35:
+                    continue
+                sig = _compute_market_signal(name, prices)
+                score = sig.get("composite_score", 0)
+                if abs(score) < threshold:
+                    continue
+                specs = await client.get_symbol_specs(name)
+                lot = specs.get("volume_min") or 0
+                if not lot or lot > max_lot:
+                    continue  # skip symbols whose min lot is too large
+                side = "buy" if score > 0 else "sell"
+                reason = f"auto score {score:+d}: {sig.get('reason', '')}"
+                result = await _do_place_trade_mt5(name, side, lot, reason=reason)
+                if "placed" in result.lower():
+                    logger.info("Autotrade: %s", result)
+                    await asyncio.to_thread(_notify_telegram, f"🤖 {result}\n↳ {reason}")
+                else:
+                    logger.info("Autotrade skip %s: %s", name, result)
+        except Exception as e:
+            logger.warning("Autotrade loop error: %s", e)
+        await asyncio.sleep(interval)
 
 
 if __name__ == "__main__":
