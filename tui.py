@@ -134,6 +134,19 @@ def size_text(t: dict[str, Any]) -> str:
     return f"{amount:.2f}" if is_mt5_trade(t) else f"${amount:.2f}"
 
 
+def local_time(iso_str, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format an API timestamp (naive UTC ISO) in the viewer's local timezone."""
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", ""))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime(fmt)
+    except Exception:
+        return str(iso_str)[:16].replace("T", " ")
+
+
 # ─── Trade Detail Modal ───────────────────────────────────────────────────────
 
 class TradeDetailModal(ModalScreen):
@@ -164,8 +177,8 @@ class TradeDetailModal(ModalScreen):
             ("Status",         t.get("status", "—").upper()),
             ("Stop Loss",      f"{t['stop_loss']:.5f}"   if t.get("stop_loss")   else "—"),
             ("Take Profit",    f"{t['take_profit']:.5f}" if t.get("take_profit") else "—"),
-            ("Opened",         (t.get("created_at", "—") or "—")[:19].replace("T", " ")),
-            ("Closed",         (t.get("closed_at",  "—") or "—")[:19].replace("T", " ")),
+            ("Opened",         local_time(t.get("created_at"), "%Y-%m-%d %H:%M:%S")),
+            ("Closed",         local_time(t.get("closed_at"),  "%Y-%m-%d %H:%M:%S")),
         ]
 
         mid = len(rows) // 2
@@ -232,6 +245,11 @@ class DerivTradingApp(App):
     #main-split { height: 1fr; }
     #left-col   { width: 56%; }
     #right-col  { width: 44%; }
+
+    /* ── DataTable cursor: tint only, keep the red/green cell colors; ──
+       blurred (unfocused) shows no highlight, so Esc/Tab acts as deselect. */
+    DataTable:focus > .datatable--cursor { background: $primary 30%; }
+    DataTable > .datatable--cursor       { background: transparent; }
 
     /* ── Market table ──────────────────────── */
     #market-table { height: 10; }
@@ -331,6 +349,7 @@ class DerivTradingApp(App):
         Binding("r", "refresh_all",         "Refresh"),
         Binding("a", "toggle_auto_refresh", "Auto"),
         Binding("ctrl+l", "clear_log",      "Clear Log"),
+        Binding("escape", "deselect",       "Deselect", show=False),
         Binding("q", "quit",                "Quit"),
         Binding("j", "scroll_down_table",   "↓", show=False),
         Binding("k", "scroll_up_table",     "↑", show=False),
@@ -390,7 +409,7 @@ class DerivTradingApp(App):
                     with Vertical(id="right-col"):
                         yield DataTable(id="open-trades-table", classes="panel", cursor_type="row")
                         yield DataTable(id="signals-table", classes="panel", cursor_type="row")
-                        yield RichLog(id="agent-log", markup=True, classes="panel")
+                        yield RichLog(id="agent-log", markup=True, classes="panel", auto_scroll=False)
                 yield RichLog(id="activity-log", classes="panel", markup=True)
 
             # ── Place Trade ────────────────────────────────────────────────
@@ -647,7 +666,8 @@ class DerivTradingApp(App):
             if self._modal_open:
                 return
             table = self.query_one("#open-trades-table", DataTable)
-            scroll_x = table.scroll_x  # preserve horizontal scroll position
+            scroll_x = table.scroll_x  # preserve scroll position across the redraw
+            scroll_y = table.scroll_y
             table.clear()
             self._open_trade_rows.clear()
 
@@ -679,7 +699,7 @@ class DerivTradingApp(App):
                     self._open_trade_rows[trade_id] = t
 
             # Restore scroll position after redraw
-            self.call_after_refresh(lambda: table.scroll_to(scroll_x, 0, animate=False))
+            self.call_after_refresh(lambda: table.scroll_to(scroll_x, scroll_y, animate=False))
 
             # Update portfolio panel
             stats_resp = await api_get("/api/trades/summary")
@@ -807,6 +827,7 @@ class DerivTradingApp(App):
             trades = [t for t in resp.get("trades", []) if t.get("status") == "closed"]
             trades.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
             table = self.query_one("#history-table", DataTable)
+            scroll_x, scroll_y = table.scroll_x, table.scroll_y  # preserve across redraw
             table.clear()
             for t in trades:
                 pnl = t.get("profit_loss")
@@ -817,8 +838,7 @@ class DerivTradingApp(App):
                 dir_text = direction_text(t)
                 symbol = t.get("symbol", "")
                 trade_id = str(t.get("trade_id", t.get("id", "")))
-                closed = t.get("closed_at", "")
-                closed_short = closed[:16].replace("T", " ") if closed else "—"
+                closed_short = local_time(t.get("closed_at"), "%Y-%m-%d %H:%M")
 
                 exit_price = t.get("exit_price") or 0
                 exit_str = f"{exit_price:.5f}" if exit_price else "—"
@@ -836,6 +856,7 @@ class DerivTradingApp(App):
                     pnl_text,
                     closed_short,
                 )
+            self.call_after_refresh(lambda: table.scroll_to(scroll_x, scroll_y, animate=False))
         except Exception as e:
             self._log(f"[red]History error: {e}[/red]")
 
@@ -847,6 +868,10 @@ class DerivTradingApp(App):
         try:
             resp = await api_get("/api/trades/agent")
             log = self.query_one("#agent-log", RichLog)
+            # Preserve the reader's scroll position across the rebuild: only
+            # snap to the newest entry if they were already at the bottom.
+            prev_y = log.scroll_y
+            at_bottom = (log.max_scroll_y - log.scroll_y) <= 1
             log.clear()
             if not resp.get("success"):
                 log.write("[dim]Agent endpoint unavailable[/dim]")
@@ -858,8 +883,7 @@ class DerivTradingApp(App):
                 return
             recent = sorted(trades, key=lambda t: t.get("created_at") or "", reverse=True)[:30]
             for t in recent:
-                ts_raw = t.get("created_at", "")
-                ts = ts_raw[11:16] if len(ts_raw) >= 16 else "--:--"
+                ts = local_time(t.get("created_at"), "%H:%M")
                 direction = t.get("type", t.get("trade_type", "")).upper()
                 is_buy = direction in ("MULTUP", "CALL", "BUY")
                 dir_color = "green" if is_buy else "red"
@@ -884,6 +908,10 @@ class DerivTradingApp(App):
                 reason = t.get("reason")
                 if reason:
                     log.write(f"   [dim italic]↳ {str(reason)[:110]}[/dim italic]")
+            self.call_after_refresh(
+                lambda: log.scroll_end(animate=False) if at_bottom
+                else log.scroll_to(y=prev_y, animate=False)
+            )
         except Exception as e:
             self._log(f"[yellow]Activity feed error: {e}[/yellow]")
 
@@ -1412,6 +1440,14 @@ class DerivTradingApp(App):
     def action_clear_log(self) -> None:
         try:
             self.query_one("#activity-log", RichLog).clear()
+        except Exception:
+            pass
+
+    def action_deselect(self) -> None:
+        """Drop focus from the current table so its row highlight clears
+        (the blurred cursor is transparent)."""
+        try:
+            self.screen.set_focus(None)
         except Exception:
             pass
 
