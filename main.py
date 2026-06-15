@@ -22,6 +22,7 @@ from trade_monitor import TradeMonitor
 from jose import jwt
 import os
 import asyncio
+import statistics
 from contextlib import asynccontextmanager
 import time
 import json
@@ -2533,10 +2534,13 @@ async def _autotrade_loop() -> None:
     interval = int(os.getenv("AUTOTRADE_INTERVAL", "60"))
     threshold = int(os.getenv("AUTOTRADE_THRESHOLD", "2"))
     max_lot = float(os.getenv("AUTOTRADE_MAX_LOT", "1.0"))
+    sl_mult = float(os.getenv("AUTOTRADE_SL_MULT", "1.0"))      # stop = sl_mult × stdev(recent prices); 0 disables SL/TP
+    rr = float(os.getenv("AUTOTRADE_RR", "1.5"))               # target = rr × stop distance
+    sl_floor_pct = float(os.getenv("AUTOTRADE_SL_FLOOR_PCT", "0.002"))  # min stop as % of price
     symbols = [s.strip() for s in os.getenv(
         "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V").split(",") if s.strip()]
-    logger.info("Autotrader ON: every %ds, threshold ±%d, max_lot %s, symbols %s",
-                interval, threshold, max_lot, symbols)
+    logger.info("Autotrader ON: every %ds, threshold ±%d, max_lot %s, SL=%s×stdev (floor %.2f%%) RR=%s, symbols %s",
+                interval, threshold, max_lot, sl_mult, sl_floor_pct * 100, rr, symbols)
     await asyncio.sleep(10)  # let the bridge/monitor settle after startup
     while True:
         try:
@@ -2563,8 +2567,31 @@ async def _autotrade_loop() -> None:
                 if not lot or lot > max_lot:
                     continue  # skip symbols whose min lot is too large
                 side = "buy" if score > 0 else "sell"
+
+                # Risk management: stop sized from recent price volatility (stdev)
+                # with a % floor so MT5 doesn't reject it as too tight; target =
+                # R:R × stop. Defined risk per trade + clean win/loss labels.
+                sl_price = tp_price = None
+                if sl_mult > 0:
+                    window = prices[-30:]
+                    vol = statistics.pstdev(window) if len(window) >= 5 else 0.0
+                    entry = prices[-1]
+                    dist = max(sl_mult * vol, sl_floor_pct * entry)
+                    digits = int(specs.get("digits", 2))
+                    if side == "buy":
+                        sl_price = round(entry - dist, digits)
+                        tp_price = round(entry + rr * dist, digits)
+                    else:
+                        sl_price = round(entry + dist, digits)
+                        tp_price = round(entry - rr * dist, digits)
+
                 reason = f"auto score {score:+d}: {sig.get('reason', '')}"
-                result = await _do_place_trade_mt5(name, side, lot, reason=reason)
+                result = await _do_place_trade_mt5(
+                    name, side, lot, sl_price=sl_price, tp_price=tp_price, reason=reason)
+                # If MT5 rejected the stops as invalid, retry once without SL/TP
+                # so the trade (and its data) still happens.
+                if sl_price and result.startswith("Error") and "nvalid" in result:
+                    result = await _do_place_trade_mt5(name, side, lot, reason=reason)
                 if "placed" in result.lower():
                     logger.info("Autotrade: %s", result)
                     await asyncio.to_thread(_notify_telegram, f"🤖 {result}\n↳ {reason}")
