@@ -315,8 +315,10 @@ ALLOWED_SYMBOLS = {
     # 1-second volatility indices (all available)
     "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V",
     "1HZ50V", "1HZ75V", "1HZ90V", "1HZ100V",
-    # Crash/Boom indices (structurally biased — spike trading)
-    "CRASH1000", "BOOM1000",
+    # Crash/Boom indices BLACKLISTED (0% WR, -$38.14 — spike strategy failed):
+    # "CRASH1000", "BOOM1000" were removed 2026-06-16 after portfolio post-mortem.
+    # These instruments don't respond to RSI/MACD/BB mean-reversion signals and
+    # the structural spike-bias strategy produced 0-for-7 with -$38.14 in losses.
 }
 
 # Daily loss protection limits
@@ -2132,7 +2134,7 @@ def api_get_symbols(request: StarletteRequest) -> JSONResponse:
 
 
 
-TICK_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V", "1HZ25V", "1HZ15V", "1HZ30V", "1HZ90V", "R_10", "R_25", "1HZ10V", "CRASH1000", "BOOM1000"]
+TICK_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V", "1HZ25V", "1HZ15V", "1HZ30V", "1HZ90V", "R_10", "R_25", "1HZ10V"]
 
 @mcp.custom_route("/api/prices", methods=["GET"])
 async def api_prices(request: StarletteRequest) -> JSONResponse:
@@ -2619,6 +2621,21 @@ async def _balance_snapshot_loop() -> None:
 from notify import notify_telegram as _notify_telegram  # shared stdlib Telegram notifier
 
 
+def _autotrade_side(score: int, threshold: int, longs_only: bool) -> Optional[str]:
+    """Decide the trade side from a composite signal score.
+
+    Returns 'buy', 'sell', or None (no trade). Refined ruleset 2026-06-16:
+    longs-only by default — the demo edge lived entirely in the long
+    mean-reversion signal (score +2: 75% win), while the mirror short lost
+    money. Set AUTOTRADE_LONGS_ONLY=false to allow shorts again.
+    """
+    if longs_only:
+        return "buy" if score >= threshold else None
+    if abs(score) >= threshold:
+        return "buy" if score > 0 else "sell"
+    return None
+
+
 async def _autotrade_loop() -> None:
     """Deterministic (no-LLM) autotrader. Scans configured symbols on an interval,
     places a min-lot MT5 trade when |composite_score| >= threshold (reusing the
@@ -2633,10 +2650,11 @@ async def _autotrade_loop() -> None:
     rr = float(os.getenv("AUTOTRADE_RR", "1.5"))               # target = rr × stop distance
     spike_rr = float(os.getenv("AUTOTRADE_SPIKE_RR", "4.0"))    # wider target for Crash/Boom spike entries
     sl_floor_pct = float(os.getenv("AUTOTRADE_SL_FLOOR_PCT", "0.002"))  # min stop as % of price
+    longs_only = os.getenv("AUTOTRADE_LONGS_ONLY", "true").lower() == "true"
     symbols = [s.strip() for s in os.getenv(
         "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V").split(",") if s.strip()]
-    logger.info("Autotrader ON: every %ds, threshold ±%d, max_lot %s, SL=%s×stdev (floor %.2f%%) RR=%s, symbols %s",
-                interval, threshold, max_lot, sl_mult, sl_floor_pct * 100, rr, symbols)
+    logger.info("Autotrader ON: every %ds, threshold +%d, longs_only=%s, max_lot %s, SL=%s×stdev (floor %.2f%%) RR=%s, symbols %s",
+                interval, threshold, longs_only, max_lot, sl_mult, sl_floor_pct * 100, rr, symbols)
     await asyncio.sleep(10)  # let the bridge/monitor settle after startup
     while True:
         try:
@@ -2655,22 +2673,20 @@ async def _autotrade_loop() -> None:
                 if len(prices) < 35:
                     continue
                 lname = name.lower()
-                is_spike = "crash" in lname or "boom" in lname
-                if is_spike:
-                    # Structural bias: Boom only spikes UP, Crash only spikes DOWN.
-                    # Trade in the spike direction (positive skew: small drift
-                    # losses, occasional large spike win). No TA score.
-                    side = "buy" if "boom" in lname else "sell"
-                    eff_rr = spike_rr
-                    entry_label = "spike"
-                else:
-                    sig = _compute_market_signal(name, prices)
-                    score = sig.get("composite_score", 0)
-                    if abs(score) < threshold:
-                        continue
-                    side = "buy" if score > 0 else "sell"
-                    eff_rr = rr
-                    entry_label = f"score {score:+d}: {sig.get('reason', '')}"
+                # Spike strategy DISABLED 2026-06-16: Boom/Crash 1000 went 0-for-7 (-$38.14).
+                # The structural spike-bias approach (always-buy Boom, always-sell Crash)
+                # did not produce edge on this account. Re-enable only with a proven
+                # entry filter that is NOT the same as the volatility-index TA signal.
+                is_spike = False  # was: "crash" in lname or "boom" in lname
+                # Spike strategy REMOVED 2026-06-16: Boom/Crash 1000 0-for-7 (-$38.14).
+                # Entire spike code path is dead — is_spike always False.
+                sig = _compute_market_signal(name, prices)
+                score = sig.get("composite_score", 0)
+                side = _autotrade_side(score, threshold, longs_only)
+                if side is None:
+                    continue
+                eff_rr = rr
+                entry_label = f"score {score:+d}: {sig.get('reason', '')}"
                 specs = await client.get_symbol_specs(name)
                 lot = specs.get("volume_min") or 0
                 if not lot or lot > max_lot:
@@ -2692,6 +2708,13 @@ async def _autotrade_loop() -> None:
                     min_stop = specs.get("stops_level", 0) * specs.get("point", 0.0)
                     sl_dist = max(sl_mult * vol, sl_floor_pct * entry, min_stop * 1.5)
                     tp_dist = eff_rr * sl_dist
+
+                # Refined ruleset: SL/TP is mandatory. Never place a naked trade —
+                # the unprotected trades in the demo lost -$51 of the total. If the
+                # stop couldn't be sized (sl_mult=0 or no volatility), skip.
+                if sl_dist is None or tp_dist is None:
+                    logger.info("Autotrade skip %s: SL/TP unavailable — refusing naked trade", name)
+                    continue
 
                 reason = f"auto {entry_label}"
                 result = await _do_place_trade_mt5(

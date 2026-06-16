@@ -66,6 +66,10 @@ class TradeMonitor:
         else:
             self.deriv_client = DerivAPIClient()
         self.poll_interval = poll_interval
+        # Time-stop: force-close any still-open MT5 position older than this many
+        # minutes. MT5 enforces SL/TP server-side, but a position can drift
+        # sideways for hours — in the demo data losers ran up to 11.6h. 0 disables.
+        self.max_hold_minutes = int(os.getenv("AUTOTRADE_MAX_HOLD_MIN", "120"))
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._processed_contracts: Set[str] = set()
@@ -200,7 +204,7 @@ class TradeMonitor:
         """MT5 settlement reconciliation. SL/TP are enforced server-side, so the
         monitor only needs to detect when a tracked open ticket has left
         positions_get() (closed) and settle it from history_deals_get()."""
-        result = {"checked": 0, "closed": 0, "errors": 0}
+        result = {"checked": 0, "closed": 0, "time_stops": 0, "errors": 0}
         async with self._check_trades_lock:
             open_trades = [t for t in self._get_open_trades() if t.mt5_ticket]
             if not open_trades:
@@ -220,6 +224,26 @@ class TradeMonitor:
                     # read-only cluster backend can serve them to the TUI.
                     TradingRepository.update_live_price(
                         t.trade_id, p.get("current_price"), p.get("profit_loss"))
+                    # Time-stop: cap how long a trade can bleed sideways. Once the
+                    # hold exceeds max_hold_minutes, force a market close; the next
+                    # reconcile cycle settles it (and fires the Telegram close ping).
+                    if self.max_hold_minutes > 0 and t.created_at:
+                        age_min = (datetime.utcnow() - t.created_at).total_seconds() / 60
+                        if age_min >= self.max_hold_minutes:
+                            try:
+                                cr = await self.deriv_client.close_position(int(t.mt5_ticket))
+                                if cr.get("success"):
+                                    result["time_stops"] += 1
+                                    logger.info(
+                                        "Time-stop: closed %s #%s after %.0fmin (limit %dmin)",
+                                        t.symbol, t.mt5_ticket, age_min, self.max_hold_minutes)
+                                else:
+                                    logger.warning(
+                                        "Time-stop close failed for #%s: %s",
+                                        t.mt5_ticket, cr.get("error") or cr.get("comment"))
+                            except Exception as e:
+                                logger.error("Time-stop error for #%s: %s", t.mt5_ticket, e)
+                                result["errors"] += 1
                     continue
                 try:
                     close = await self.deriv_client.get_position_close(int(t.mt5_ticket))
