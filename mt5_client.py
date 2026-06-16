@@ -360,3 +360,26 @@ class MT5Client:
             return await self._call(_f)
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    async def set_position_sltp(self, ticket: int, sl_price: Optional[float] = None,
+                                tp_price: Optional[float] = None) -> Dict[str, Any]:
+        """Attach/modify SL and/or TP on an open position (TRADE_ACTION_SLTP).
+        Used to set stops from the *actual* fill price after a market order, so
+        spiky symbols (Crash/Boom) never get an SL on the wrong side of the fill."""
+        def _f(mt5):
+            pos = mt5.positions_get(ticket=int(ticket))
+            if not pos:
+                return {"success": False, "error": "position not found"}
+            p = pos[0]
+            req = {"action": mt5.TRADE_ACTION_SLTP, "symbol": p.symbol,
+                   "position": int(ticket),
+                   "sl": float(sl_price) if sl_price is not None else float(p.sl),
+                   "tp": float(tp_price) if tp_price is not None else float(p.tp)}
+            res = mt5.order_send(req)
+            ok = res is not None and res.retcode == mt5.TRADE_RETCODE_DONE
+            return {"success": ok, "retcode": getattr(res, "retcode", None),
+                    "comment": getattr(res, "comment", None)}
+        try:
+            return await self._call(_f)
+        except Exception as e:
+            return {"success": False, "error": str(e)}

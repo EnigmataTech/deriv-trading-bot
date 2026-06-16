@@ -1681,6 +1681,8 @@ async def _do_place_trade_mt5(
     tp_price: Optional[float] = None,
     entry_price: Optional[float] = None,
     reason: Optional[str] = None,
+    sl_dist: Optional[float] = None,
+    tp_dist: Optional[float] = None,
 ) -> str:
     """Place an MT5-native order: lot size + price-level SL/TP (+ optional pending
     entry). Persists trade_id=str(ticket) and the typed mt5_ticket so the monitor
@@ -1707,8 +1709,15 @@ async def _do_place_trade_mt5(
     if vmin and lot < vmin:
         return (f"Error: lot {lot} below min {vmin} for {symbol} "
                 f"(step {specs.get('volume_step')}, max {specs.get('volume_max')})")
-    res = await client.place_order(symbol, side, lot, sl_price=sl_price,
-                                   tp_price=tp_price, entry_price=entry_price)
+    # Distance-based SL/TP: place the market order naked (never rejected for
+    # bad stops) and attach SL/TP from the real fill afterwards. Absolute
+    # sl_price/tp_price (manual/agent path) keep the inline behavior.
+    use_dist = sl_dist is not None or tp_dist is not None
+    res = await client.place_order(
+        symbol, side, lot,
+        sl_price=None if use_dist else sl_price,
+        tp_price=None if use_dist else tp_price,
+        entry_price=entry_price)
     if not res.get("success"):
         err = res.get("error") or res.get("comment") or f"retcode {res.get('retcode')}"
         log_error(Exception(str(err)), "place_trade_mt5", error_code="MT5_ORDER_ERROR")
@@ -1724,6 +1733,21 @@ async def _do_place_trade_mt5(
             fill = float(tick_resp.get("tick", {}).get("quote", 0))
         except Exception:
             pass
+
+    # Attach SL/TP computed from the *actual* fill price (robust for Crash/Boom).
+    if use_dist and fill and ticket:
+        digits = int(specs.get("digits", 2))
+        if side == "buy":
+            sl_price = round(fill - sl_dist, digits) if sl_dist else None
+            tp_price = round(fill + tp_dist, digits) if tp_dist else None
+        else:
+            sl_price = round(fill + sl_dist, digits) if sl_dist else None
+            tp_price = round(fill - tp_dist, digits) if tp_dist else None
+        sltp = await client.set_position_sltp(ticket, sl_price, tp_price)
+        if not sltp.get("success"):
+            logger.warning("SL/TP modify failed for #%s: %s — position left open without stops",
+                           ticket, sltp.get("comment") or sltp.get("error"))
+            sl_price = tp_price = None  # persist reality
 
     TradingRepository.create_trade_with_sl_tp(
         user_id=user_id, trade_id=str(ticket), symbol=symbol,
@@ -2655,31 +2679,23 @@ async def _autotrade_loop() -> None:
                 # Risk management: stop sized from recent price volatility (stdev)
                 # with a % floor so MT5 doesn't reject it as too tight; target =
                 # R:R × stop. Defined risk per trade + clean win/loss labels.
-                sl_price = tp_price = None
+                # Risk sized as a *distance* from the fill price (not an absolute
+                # level off a stale tick): the order fills naked, then SL/TP are
+                # attached from the real fill — so Crash/Boom spikes can't land an
+                # SL on the wrong side of the fill. Floor the stop above (a) a %
+                # of price and (b) MT5's min stop distance for this symbol.
+                sl_dist = tp_dist = None
                 if sl_mult > 0:
                     window = prices[-30:]
                     vol = statistics.pstdev(window) if len(window) >= 5 else 0.0
                     entry = prices[-1]
-                    # Floor the stop above (a) a % of price and (b) MT5's min
-                    # stop distance for this symbol, so low-priced symbols don't
-                    # get their stops rejected (which would leave them unprotected).
                     min_stop = specs.get("stops_level", 0) * specs.get("point", 0.0)
-                    dist = max(sl_mult * vol, sl_floor_pct * entry, min_stop * 1.5)
-                    digits = int(specs.get("digits", 2))
-                    if side == "buy":
-                        sl_price = round(entry - dist, digits)
-                        tp_price = round(entry + eff_rr * dist, digits)
-                    else:
-                        sl_price = round(entry + dist, digits)
-                        tp_price = round(entry - eff_rr * dist, digits)
+                    sl_dist = max(sl_mult * vol, sl_floor_pct * entry, min_stop * 1.5)
+                    tp_dist = eff_rr * sl_dist
 
                 reason = f"auto {entry_label}"
                 result = await _do_place_trade_mt5(
-                    name, side, lot, sl_price=sl_price, tp_price=tp_price, reason=reason)
-                # If MT5 rejected the stops as invalid, retry once without SL/TP
-                # so the trade (and its data) still happens.
-                if sl_price and result.startswith("Error") and "nvalid" in result:
-                    result = await _do_place_trade_mt5(name, side, lot, reason=reason)
+                    name, side, lot, sl_dist=sl_dist, tp_dist=tp_dist, reason=reason)
                 if "placed" in result.lower():
                     logger.info("Autotrade: %s", result)
                     await asyncio.to_thread(_notify_telegram, f"🤖 {result}\n↳ {reason}")
