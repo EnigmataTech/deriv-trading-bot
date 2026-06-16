@@ -1,0 +1,9 @@
+# Deployed to the VPS at ~/.config/systemd/user/weekly-report.service
+[Unit]
+Description=Weekly strategy-performance report (Telegram + DB record)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/workspace/deriv-trading-bot
+ExecStart=%h/.local/bin/uv run python scripts/weekly_report.py

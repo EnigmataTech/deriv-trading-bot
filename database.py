@@ -102,6 +102,23 @@ class Portfolio(Base):
     free_margin = Column(Float, nullable=False, default=0.0)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
+
+class StrategyReport(Base):
+    """Periodic strategy-performance snapshot, produced by the weekly report job.
+    Kept as a durable, queryable record of how the refined ruleset is doing over
+    time (see scripts/weekly_report.py)."""
+    __tablename__ = "strategy_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    period_days = Column(Integer, nullable=False)   # lookback window for this report
+    total_trades = Column(Integer, nullable=False, default=0)
+    win_rate = Column(Float, nullable=False, default=0.0)        # 0..1
+    total_pnl = Column(Float, nullable=False, default=0.0)
+    profit_factor = Column(Float, nullable=False, default=0.0)
+    report_text = Column(Text, nullable=False)       # full human-readable report
+
+
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
