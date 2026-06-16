@@ -49,7 +49,7 @@ load_dotenv()
 API_BASE = os.getenv("TRADING_API_URL", "http://trading.enigmata.local").rstrip("/")
 MCP_AGENT_USER_ID = os.getenv("MCP_AGENT_USER_ID", "hermes_agent")
 
-DEFAULT_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V"]
+DEFAULT_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V", "CRASH1000", "BOOM1000"]
 
 ALLOWED_SYMBOLS = sorted([
     # Standard volatility indices
@@ -57,6 +57,8 @@ ALLOWED_SYMBOLS = sorted([
     # 1-second volatility indices (all available)
     "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V",
     "1HZ50V", "1HZ75V", "1HZ90V", "1HZ100V",
+    # Crash/Boom indices
+    "CRASH1000", "BOOM1000",
 ])
 
 QUICK_TRADES: dict[str, tuple[str, str, float]] = {

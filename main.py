@@ -315,6 +315,8 @@ ALLOWED_SYMBOLS = {
     # 1-second volatility indices (all available)
     "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V",
     "1HZ50V", "1HZ75V", "1HZ90V", "1HZ100V",
+    # Crash/Boom indices (structurally biased — spike trading)
+    "CRASH1000", "BOOM1000",
 }
 
 # Daily loss protection limits
@@ -1463,7 +1465,8 @@ async def api_get_market_data(request: StarletteRequest) -> JSONResponse:
         if err:
             return JSONResponse({"success": False, "error": err}, status_code=400)
 
-        result = await _do_get_market_data(validated_symbol)
+        broker_symbol = get_symbol_display_name(validated_symbol) if BROKER == "mt5" else validated_symbol
+        result = await _do_get_market_data(broker_symbol)
         log_api_call(f"/api/market-data/{validated_symbol}", "GET", 200)
         return JSONResponse({"success": True, "data": result, "symbol": validated_symbol})
     except Exception as e:
@@ -1507,8 +1510,9 @@ async def api_get_candles(request: StarletteRequest) -> JSONResponse:
             return JSONResponse({"success": False, "error": "invalid count format"}, status_code=400)
 
         client = await get_deriv_client()
+        broker_symbol = get_symbol_display_name(validated_symbol) if BROKER == "mt5" else validated_symbol
         try:
-            response = await client.get_candles(validated_symbol, granularity, count)
+            response = await client.get_candles(broker_symbol, granularity, count)
 
             if 'error' in response:
                 return JSONResponse({
@@ -2104,7 +2108,7 @@ def api_get_symbols(request: StarletteRequest) -> JSONResponse:
 
 
 
-TICK_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V", "1HZ25V", "1HZ15V", "1HZ30V", "1HZ90V", "R_10", "R_25", "1HZ10V"]
+TICK_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V", "1HZ25V", "1HZ15V", "1HZ30V", "1HZ90V", "R_10", "R_25", "1HZ10V", "CRASH1000", "BOOM1000"]
 
 @mcp.custom_route("/api/prices", methods=["GET"])
 async def api_prices(request: StarletteRequest) -> JSONResponse:
