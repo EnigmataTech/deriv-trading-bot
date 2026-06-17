@@ -18,7 +18,6 @@ except ModuleNotFoundError:  # pragma: no cover - MT5-only deployments
 
 from sqlalchemy import or_, and_
 
-from deriv_client import DerivAPIClient
 from database import Trade, SessionLocal, TradingRepository
 from notify import notify_telegram
 
@@ -46,7 +45,7 @@ class TradeMonitor:
 
     def __init__(
         self,
-        deriv_client: Optional[DerivAPIClient] = None,
+        deriv_client: Optional[object] = None,
         poll_interval: int = DEFAULT_POLL_INTERVAL
     ):
         """
@@ -64,7 +63,10 @@ class TradeMonitor:
             from mt5_client import MT5Client
             self.deriv_client = MT5Client()
         else:
-            self.deriv_client = DerivAPIClient()
+            # The Deriv WS client was decommissioned in the MT5 migration. The
+            # monitor only runs on the trader (BROKER=mt5); the read-only cluster
+            # backend doesn't monitor (nothing to reconcile).
+            raise RuntimeError("TradeMonitor requires BROKER=mt5 (Deriv client removed)")
         self.poll_interval = poll_interval
         # Time-stop: force-close any still-open MT5 position older than this many
         # minutes. MT5 enforces SL/TP server-side, but a position can drift

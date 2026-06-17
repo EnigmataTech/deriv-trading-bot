@@ -6,7 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse, Response, HTMLResponse
 from database import TradingRepository
-from deriv_client import DerivAPIClient, TechnicalIndicators
+from indicators import TechnicalIndicators
 from symbols import get_symbol_display_name
 from analytics import (
     ClosedTrade,
@@ -504,9 +504,7 @@ def validate_trade_params(body: dict) -> tuple[Optional[dict], Optional[JSONResp
         "trailing_stop_distance": trailing_stop_distance
     }, None
 
-_shared_client: Optional[DerivAPIClient] = None
 _mt5_client: Optional[object] = None  # MT5Client instance (BROKER=mt5)
-_tick_stream: Optional[object] = None  # DerivTickStream instance
 
 # Active broker for the trading core. "mt5" = the VPS trader talking to the
 # headless MT5 terminal via the mt5linux bridge; "deriv" = legacy Deriv WS API.
@@ -522,18 +520,16 @@ async def get_deriv_client():
     balance call sites work unchanged; the Deriv-specific trade/contract calls
     are branched on BROKER at their call sites.
     """
-    global _shared_client, _mt5_client
-    if BROKER == "mt5":
-        if _mt5_client is None:
-            from mt5_client import MT5Client
-            _mt5_client = MT5Client()
-        return _mt5_client
-    from websockets.protocol import State
-    if _shared_client is None:
-        _shared_client = DerivAPIClient()
-    if not _shared_client.websocket or _shared_client.websocket.state != State.OPEN:
-        await _shared_client.connect()
-    return _shared_client
+    global _mt5_client
+    if BROKER != "mt5":
+        raise RuntimeError(
+            "No live broker available: BROKER != 'mt5'. The legacy Deriv WS client "
+            "was decommissioned in the MT5 migration; read-only deployments must "
+            "serve from Postgres snapshots, not a live broker.")
+    if _mt5_client is None:
+        from mt5_client import MT5Client
+        _mt5_client = MT5Client()
+    return _mt5_client
 
 # ============ Business Logic Functions (shared by MCP tools and REST endpoints) ============
 
@@ -2181,14 +2177,10 @@ TICK_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V", "1HZ25V"
 
 @mcp.custom_route("/api/prices", methods=["GET"])
 async def api_prices(request: StarletteRequest) -> JSONResponse:
-    """Cached live tick prices. Starts the Deriv subscription on first call."""
-    global _tick_stream
-    if _tick_stream is None:
-        from deriv_client import DerivTickStream
-        _tick_stream = DerivTickStream()
-        asyncio.create_task(_tick_stream.run(TICK_SYMBOLS))
-        logger.info(f"Tick stream started for {TICK_SYMBOLS}")
-    return JSONResponse({"success": True, "prices": _tick_stream.prices})
+    """Live tick prices. The Deriv tick-stream subscription was decommissioned in
+    the MT5 migration; this will be served from the VPS→Postgres price snapshot
+    (Phase C). Returns an empty map for now — the TUI handles that gracefully."""
+    return JSONResponse({"success": True, "prices": {}})
 
 
 @mcp.custom_route("/health", methods=["GET"])

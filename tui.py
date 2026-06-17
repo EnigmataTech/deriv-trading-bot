@@ -796,7 +796,7 @@ class DerivTradingApp(App):
                     close_prices if len(close_prices) >= 15 else None
                 )
                 if indicator_src:
-                    from deriv_client import TechnicalIndicators
+                    from indicators import TechnicalIndicators
                     rsi_list = TechnicalIndicators.calculate_rsi(indicator_src)
                     sma_list = TechnicalIndicators.calculate_sma(indicator_src, 14)
                     if rsi_list and rsi_list[-1] is not None:

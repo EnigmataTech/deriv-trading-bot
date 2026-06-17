@@ -20,7 +20,7 @@ from analytics import (
     duration_quality_report,
     streak_risk_assessment,
 )
-from deriv_client import TechnicalIndicators as TI
+from indicators import TechnicalIndicators as TI
 
 
 PASS = 0
