@@ -34,27 +34,36 @@ def migrate_database():
     from sqlalchemy import inspect, text
 
     inspector = inspect(engine)
-    if 'trades' not in inspector.get_table_names():
-        return  # Table doesn't exist yet, will be created by create_all
+    tables = inspector.get_table_names()
 
-    existing_columns = [col['name'] for col in inspector.get_columns('trades')]
-    new_columns = {
-        'stop_loss': 'FLOAT',
-        'take_profit': 'FLOAT',
-        'trailing_stop_distance': 'FLOAT',
-        'trailing_stop_price': 'FLOAT',
-        'highest_price_seen': 'FLOAT',
-        'mt5_ticket': 'BIGINT',
-        'reason': 'TEXT',
-        'current_price': 'FLOAT',
-        'unrealized_pnl': 'FLOAT'
+    # create_all adds NEW tables but never ALTERs existing ones, so back-fill
+    # columns added after a table first shipped. {table: {column: SQL type}}.
+    migrations = {
+        'trades': {
+            'stop_loss': 'FLOAT',
+            'take_profit': 'FLOAT',
+            'trailing_stop_distance': 'FLOAT',
+            'trailing_stop_price': 'FLOAT',
+            'highest_price_seen': 'FLOAT',
+            'mt5_ticket': 'BIGINT',
+            'reason': 'TEXT',
+            'current_price': 'FLOAT',
+            'unrealized_pnl': 'FLOAT',
+        },
+        'portfolios': {
+            'peak_equity': 'FLOAT NOT NULL DEFAULT 0.0',  # max-drawdown high-water mark
+        },
     }
 
     with engine.connect() as conn:
-        for col_name, col_type in new_columns.items():
-            if col_name not in existing_columns:
-                conn.execute(text(f'ALTER TABLE trades ADD COLUMN {col_name} {col_type}'))
-                conn.commit()
+        for table, cols in migrations.items():
+            if table not in tables:
+                continue  # will be created by create_all
+            existing = [c['name'] for c in inspector.get_columns(table)]
+            for col_name, col_type in cols.items():
+                if col_name not in existing:
+                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col_name} {col_type}'))
+                    conn.commit()
 
 
 # Run migration before create_all. Tolerate Postgres being unreachable at
@@ -100,6 +109,7 @@ class Portfolio(Base):
     equity = Column(Float, nullable=False, default=0.0)
     margin = Column(Float, nullable=False, default=0.0)
     free_margin = Column(Float, nullable=False, default=0.0)
+    peak_equity = Column(Float, nullable=False, default=0.0)  # high-water mark for max-drawdown kill-switch
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -193,6 +203,8 @@ class TradingRepository:
                 portfolio.equity = equity
                 portfolio.margin = margin
                 portfolio.free_margin = free_margin
+                # Track the equity high-water mark for the max-drawdown kill-switch.
+                portfolio.peak_equity = max(portfolio.peak_equity or 0.0, equity)
                 portfolio.updated_at = datetime.utcnow()
             else:
                 portfolio = Portfolio(
@@ -200,7 +212,8 @@ class TradingRepository:
                     balance=balance,
                     equity=equity,
                     margin=margin,
-                    free_margin=free_margin
+                    free_margin=free_margin,
+                    peak_equity=equity,
                 )
                 db.add(portfolio)
             db.commit()

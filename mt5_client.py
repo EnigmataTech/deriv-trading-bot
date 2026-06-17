@@ -218,6 +218,11 @@ class MT5Client:
                 "point": float(getattr(si, "point", 0.0)),
                 "stops_level": int(getattr(si, "trade_stops_level", 0)),
                 "trade_allowed": getattr(si, "trade_mode", 0) != 0,
+                # Monetary value of one tick per 1.0 lot, and the tick size in
+                # price units — used for fixed-fractional (2%) position sizing.
+                "tick_value": float(getattr(si, "trade_tick_value", 0.0)),
+                "tick_size": float(getattr(si, "trade_tick_size", 0.0)),
+                "contract_size": float(getattr(si, "trade_contract_size", 0.0)),
             }
         try:
             return await self._call(_f)

@@ -322,7 +322,9 @@ ALLOWED_SYMBOLS = {
 }
 
 # Daily loss protection limits
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "100"))  # $100 default
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "100"))  # flat-$ fallback when no balance snapshot
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))  # 5% of balance/day (research-backed)
+MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "0.20"))      # 20% equity-drawdown kill-switch
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "50"))  # 50 trades per day
 
 
@@ -332,7 +334,7 @@ def check_daily_loss_limit(user_id: str) -> tuple[bool, Optional[str]]:
     Returns (can_trade, error_message).
     """
     from datetime import datetime, timedelta
-    from database import SessionLocal, Trade
+    from database import SessionLocal, Trade, Portfolio
 
     db = SessionLocal()
     try:
@@ -354,9 +356,36 @@ def check_daily_loss_limit(user_id: str) -> tuple[bool, Optional[str]]:
         )
         total_loss = abs(today_loss)
 
-        if total_loss >= MAX_DAILY_LOSS:
-            return False, f"Daily loss limit reached (${MAX_DAILY_LOSS:.2f})"
+        # Daily loss limit = MAX_DAILY_LOSS_PCT of current balance; fall back to
+        # the flat-$ MAX_DAILY_LOSS when there's no balance snapshot yet.
+        pf = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
+        balance = pf.balance if pf else 0.0
+        limit = balance * MAX_DAILY_LOSS_PCT if balance > 0 else MAX_DAILY_LOSS
 
+        if total_loss >= limit:
+            return False, f"Daily loss limit reached (${total_loss:.2f} ≥ ${limit:.2f})"
+
+        return True, None
+    finally:
+        db.close()
+
+
+def check_max_drawdown(user_id: str) -> tuple[bool, Optional[str]]:
+    """Equity-drawdown kill-switch. Returns (ok_to_trade, message). Trips when
+    current equity has fallen MAX_DRAWDOWN_PCT below the recorded peak equity
+    (high-water mark maintained by the balance-snapshot loop)."""
+    from database import SessionLocal, Portfolio
+    if MAX_DRAWDOWN_PCT <= 0:
+        return True, None
+    db = SessionLocal()
+    try:
+        pf = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
+        if not pf or not pf.peak_equity or pf.peak_equity <= 0:
+            return True, None
+        dd = (pf.peak_equity - pf.equity) / pf.peak_equity
+        if dd >= MAX_DRAWDOWN_PCT:
+            return False, (f"Max drawdown {dd*100:.1f}% (peak ${pf.peak_equity:.2f} "
+                           f"→ equity ${pf.equity:.2f})")
         return True, None
     finally:
         db.close()
@@ -2636,6 +2665,51 @@ def _autotrade_side(score: int, threshold: int, longs_only: bool) -> Optional[st
     return None
 
 
+def _atr_from_ohlc(highs: list, lows: list, closes: list, period: int = 14) -> Optional[float]:
+    """Wilder's ATR from OHLC candles. Returns the latest ATR value, or None if
+    there isn't enough data. True range = max(high-low, |high-prevclose|,
+    |low-prevclose|). Used for volatility-adaptive stop sizing (research-backed)."""
+    n = len(closes)
+    if n < period + 1 or len(highs) != n or len(lows) != n:
+        return None
+    trs = []
+    for i in range(1, n):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i - 1]),
+                 abs(lows[i] - closes[i - 1]))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period          # seed
+    k = 1.0 / period                          # Wilder smoothing
+    for tr in trs[period:]:
+        atr = atr * (1 - k) + tr * k
+    return atr
+
+
+def _size_position(balance: float, risk_pct: float, stop_dist: float,
+                   tick_value: float, tick_size: float,
+                   vmin: float, vmax: float, vstep: float) -> Optional[float]:
+    """Fixed-fractional position size: pick the lot whose loss at the stop equals
+    `risk_pct` of `balance`. Loss-per-lot = (stop_dist / tick_size) * tick_value.
+    Clamps to [vmin, vmax] and rounds DOWN to vstep. Returns None if the inputs
+    can't produce a valid lot (caller falls back to min lot)."""
+    if min(balance, risk_pct, stop_dist, tick_value, tick_size, vmin) <= 0:
+        return None
+    loss_per_lot = (stop_dist / tick_size) * tick_value
+    if loss_per_lot <= 0:
+        return None
+    raw = (balance * risk_pct) / loss_per_lot
+    if vstep and vstep > 0:
+        raw = (int(raw / vstep)) * vstep      # round down to a whole step
+    lot = max(vmin, raw)
+    if vmax and vmax > 0:
+        lot = min(lot, vmax)
+    # round to the step's decimal precision to avoid float dust (e.g. 0.30000000004)
+    decimals = max(0, len(str(vstep).split(".")[-1])) if (vstep and "." in str(vstep)) else 2
+    return round(lot, decimals)
+
+
 async def _autotrade_loop() -> None:
     """Deterministic (no-LLM) autotrader. Scans configured symbols on an interval,
     places a min-lot MT5 trade when |composite_score| >= threshold (reusing the
@@ -2645,78 +2719,121 @@ async def _autotrade_loop() -> None:
         return
     interval = int(os.getenv("AUTOTRADE_INTERVAL", "60"))
     threshold = int(os.getenv("AUTOTRADE_THRESHOLD", "2"))
-    max_lot = float(os.getenv("AUTOTRADE_MAX_LOT", "1.0"))
-    sl_mult = float(os.getenv("AUTOTRADE_SL_MULT", "1.0"))      # stop = sl_mult × stdev(recent prices); 0 disables SL/TP
-    rr = float(os.getenv("AUTOTRADE_RR", "1.5"))               # target = rr × stop distance
-    spike_rr = float(os.getenv("AUTOTRADE_SPIKE_RR", "4.0"))    # wider target for Crash/Boom spike entries
+    max_lot = float(os.getenv("AUTOTRADE_MAX_LOT", "0"))      # 0 ⇒ no manual cap (rely on 2% risk + broker vmax)
+    rr = float(os.getenv("AUTOTRADE_RR", "2.0"))               # target = rr × stop (min 2:1, research-backed)
     sl_floor_pct = float(os.getenv("AUTOTRADE_SL_FLOOR_PCT", "0.002"))  # min stop as % of price
+    atr_period = int(os.getenv("AUTOTRADE_ATR_PERIOD", "14"))
+    atr_mult = float(os.getenv("AUTOTRADE_ATR_MULT", "1.5"))   # stop = atr_mult × ATR
+    ema_period = int(os.getenv("AUTOTRADE_EMA_PERIOD", "50"))  # trend filter; 0 disables
+    risk_pct = float(os.getenv("AUTOTRADE_RISK_PCT", "0.02"))  # fixed-fractional risk/trade; 0 ⇒ min lot
+    timeframe = int(os.getenv("AUTOTRADE_TIMEFRAME", "900"))   # signal candle granularity (900=M15)
     longs_only = os.getenv("AUTOTRADE_LONGS_ONLY", "true").lower() == "true"
     symbols = [s.strip() for s in os.getenv(
         "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V").split(",") if s.strip()]
-    logger.info("Autotrader ON: every %ds, threshold +%d, longs_only=%s, max_lot %s, SL=%s×stdev (floor %.2f%%) RR=%s, symbols %s",
-                interval, threshold, longs_only, max_lot, sl_mult, sl_floor_pct * 100, rr, symbols)
+    user_id = get_user_id()
+    need_bars = max(35, ema_period + 1, atr_period + 1)
+    logger.info("Autotrader ON: every %ds, tf=%ds, score>=+%d, longs_only=%s, EMA%d trend, "
+                "stop=%.1f×ATR%d (floor %.2f%%), RR=%.1f, risk=%.1f%%/trade, maxDD=%.0f%%, symbols %s",
+                interval, timeframe, threshold, longs_only, ema_period, atr_mult, atr_period,
+                sl_floor_pct * 100, rr, risk_pct * 100, MAX_DRAWDOWN_PCT * 100, symbols)
     await asyncio.sleep(10)  # let the bridge/monitor settle after startup
+    dd_halted = False
     while True:
         try:
+            # Max-drawdown kill-switch: stop opening new trades once equity has
+            # fallen MAX_DRAWDOWN_PCT below its peak. Telegram-notify once on trip.
+            dd_ok, dd_msg = check_max_drawdown(user_id)
+            if not dd_ok:
+                if not dd_halted:
+                    logger.warning("Autotrader halted — %s", dd_msg)
+                    await asyncio.to_thread(_notify_telegram,
+                        f"🛑 Autotrader halted: {dd_msg}. No new trades until reviewed.")
+                    dd_halted = True
+                await asyncio.sleep(interval)
+                continue
+            dd_halted = False
+
             client = await get_deriv_client()
             try:
                 open_syms = {p.get("symbol") for p in (await client.get_open_positions() or [])}
             except Exception:
                 open_syms = set()
+
+            # Account balance for fixed-fractional sizing (once per cycle).
+            balance = 0.0
+            if risk_pct > 0:
+                try:
+                    bal = await client.get_account_balance()
+                    bd = bal.get("balance", {}) if "error" not in bal else {}
+                    balance = float(bd.get("balance") or bd.get("equity") or 0)
+                except Exception:
+                    balance = 0.0
+
             for code in symbols:
                 name = get_symbol_display_name(code)
                 if name in open_syms:
                     continue  # one position per symbol — don't stack
-                resp = await client.get_ticks_history(name, count=200)
-                prices = ([float(p) for p in resp.get("history", {}).get("prices", [])]
-                          if "error" not in resp else [])
-                if len(prices) < 35:
+
+                # Signal + ATR from candles on the configured timeframe (M15 by
+                # default — M1 is too noisy for reliable signals per the research).
+                resp = await client.get_candles(name, granularity=timeframe, count=200)
+                candles = resp.get("candles", []) if "error" not in resp else []
+                if len(candles) < need_bars:
                     continue
-                lname = name.lower()
-                # Spike strategy DISABLED 2026-06-16: Boom/Crash 1000 went 0-for-7 (-$38.14).
-                # The structural spike-bias approach (always-buy Boom, always-sell Crash)
-                # did not produce edge on this account. Re-enable only with a proven
-                # entry filter that is NOT the same as the volatility-index TA signal.
-                is_spike = False  # was: "crash" in lname or "boom" in lname
-                # Spike strategy REMOVED 2026-06-16: Boom/Crash 1000 0-for-7 (-$38.14).
-                # Entire spike code path is dead — is_spike always False.
-                sig = _compute_market_signal(name, prices)
+                closes = [c["close"] for c in candles]
+                highs = [c["high"] for c in candles]
+                lows = [c["low"] for c in candles]
+                price = closes[-1]
+
+                sig = _compute_market_signal(name, closes)
                 score = sig.get("composite_score", 0)
                 side = _autotrade_side(score, threshold, longs_only)
                 if side is None:
                     continue
-                eff_rr = rr
-                entry_label = f"score {score:+d}: {sig.get('reason', '')}"
+
+                # Trend filter: only trade with the EMA trend (buy above, sell
+                # below). Formalises the long/uptrend edge the demo data showed.
+                if ema_period > 0:
+                    ema_vals = TechnicalIndicators.calculate_ema(closes, ema_period)
+                    ema = next((x for x in reversed(ema_vals) if x is not None), None)
+                    if ema is not None:
+                        if side == "buy" and price <= ema:
+                            continue
+                        if side == "sell" and price >= ema:
+                            continue
+
                 specs = await client.get_symbol_specs(name)
-                lot = specs.get("volume_min") or 0
-                if not lot or lot > max_lot:
-                    continue  # skip symbols whose min lot is too large
-
-                # Risk management: stop sized from recent price volatility (stdev)
-                # with a % floor so MT5 doesn't reject it as too tight; target =
-                # R:R × stop. Defined risk per trade + clean win/loss labels.
-                # Risk sized as a *distance* from the fill price (not an absolute
-                # level off a stale tick): the order fills naked, then SL/TP are
-                # attached from the real fill — so Crash/Boom spikes can't land an
-                # SL on the wrong side of the fill. Floor the stop above (a) a %
-                # of price and (b) MT5's min stop distance for this symbol.
-                sl_dist = tp_dist = None
-                if sl_mult > 0:
-                    window = prices[-30:]
-                    vol = statistics.pstdev(window) if len(window) >= 5 else 0.0
-                    entry = prices[-1]
-                    min_stop = specs.get("stops_level", 0) * specs.get("point", 0.0)
-                    sl_dist = max(sl_mult * vol, sl_floor_pct * entry, min_stop * 1.5)
-                    tp_dist = eff_rr * sl_dist
-
-                # Refined ruleset: SL/TP is mandatory. Never place a naked trade —
-                # the unprotected trades in the demo lost -$51 of the total. If the
-                # stop couldn't be sized (sl_mult=0 or no volatility), skip.
-                if sl_dist is None or tp_dist is None:
-                    logger.info("Autotrade skip %s: SL/TP unavailable — refusing naked trade", name)
+                vmin = specs.get("volume_min") or 0
+                vmax = specs.get("volume_max") or 0
+                vstep = specs.get("volume_step") or 0
+                if not vmin:
                     continue
 
-                reason = f"auto {entry_label}"
+                # Stop = atr_mult × ATR, floored by % of price and MT5's min stop;
+                # target = RR × stop. SL/TP attached from the real fill downstream.
+                atr = _atr_from_ohlc(highs, lows, closes, atr_period)
+                if not atr or atr <= 0:
+                    continue
+                min_stop = specs.get("stops_level", 0) * specs.get("point", 0.0)
+                sl_dist = max(atr_mult * atr, sl_floor_pct * price, min_stop * 1.5)
+                tp_dist = rr * sl_dist
+
+                # Position size: fixed-fractional (risk_pct of balance); fall back
+                # to min lot when balance/tick data is unavailable.
+                lot = vmin
+                if risk_pct > 0 and balance > 0:
+                    sized = _size_position(
+                        balance, risk_pct, sl_dist,
+                        specs.get("tick_value", 0.0), specs.get("tick_size", 0.0),
+                        vmin, vmax, vstep)
+                    if sized:
+                        lot = sized
+                if max_lot > 0 and lot > max_lot:
+                    logger.info("Autotrade skip %s: sized lot %.4f > max_lot %.4f", name, lot, max_lot)
+                    continue
+
+                reason = (f"auto score {score:+d}: {sig.get('reason', '')} "
+                          f"[EMA{ema_period} trend, {atr_mult}×ATR stop, {risk_pct*100:.0f}% risk]")
                 result = await _do_place_trade_mt5(
                     name, side, lot, sl_dist=sl_dist, tp_dist=tp_dist, reason=reason)
                 if "placed" in result.lower():
