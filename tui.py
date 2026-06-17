@@ -49,7 +49,7 @@ load_dotenv()
 API_BASE = os.getenv("TRADING_API_URL", "http://trading.enigmata.local").rstrip("/")
 MCP_AGENT_USER_ID = os.getenv("MCP_AGENT_USER_ID", "hermes_agent")
 
-DEFAULT_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V", "CRASH1000", "BOOM1000"]
+DEFAULT_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V"]
 
 ALLOWED_SYMBOLS = sorted([
     # Standard volatility indices
@@ -57,8 +57,7 @@ ALLOWED_SYMBOLS = sorted([
     # 1-second volatility indices (all available)
     "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V",
     "1HZ50V", "1HZ75V", "1HZ90V", "1HZ100V",
-    # Crash/Boom indices
-    "CRASH1000", "BOOM1000",
+    # Crash/Boom removed 2026-06-17 — blacklisted on the bot (spike strategy failed)
 ])
 
 QUICK_TRADES: dict[str, tuple[str, str, float]] = {
@@ -105,7 +104,7 @@ SYMBOL_MULTIPLIERS: dict[str, list[int]] = {
 
 async def api_get(path: str) -> dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"{API_BASE}{path}", timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with session.get(f"{API_BASE}{path}", timeout=aiohttp.ClientTimeout(total=25)) as r:
             return await r.json()
 
 async def api_post(path: str, body: dict | None = None) -> dict[str, Any]:

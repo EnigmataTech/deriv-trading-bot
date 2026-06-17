@@ -734,7 +734,9 @@ def _orm_to_closed_trades(trades) -> list:
 
 
 _SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
-_SIGNAL_CACHE_TTL = 3.0  # seconds
+_SIGNAL_CACHE_TTL = 15.0  # seconds — TUI polls signals every 3s; a longer TTL keeps
+                          # most requests on cache so they don't serialize behind the
+                          # single shared MT5 broker connection (which spikes latency).
 
 
 def _cleanup_signal_cache():
@@ -757,7 +759,11 @@ async def _get_signal_cached(symbol: str) -> dict:
         return cached[1]
 
     client = await get_deriv_client()
-    response = await client.get_ticks_history(symbol, count=200)
+    # MT5 needs the display name ("Volatility 75 Index"), not the Deriv code
+    # ("R_75"); without this the batch/signal endpoints get "no history" and the
+    # TUI signals panel comes up empty (the autotrader already translates).
+    broker_symbol = get_symbol_display_name(symbol) if BROKER == "mt5" else symbol
+    response = await client.get_ticks_history(broker_symbol, count=200)
     if "error" in response:
         raise RuntimeError(response["error"].get("message", "ticks history failed"))
     prices = [float(p) for p in response.get("history", {}).get("prices", [])]
@@ -1470,18 +1476,26 @@ async def api_get_balance(request: StarletteRequest) -> JSONResponse:
     finally:
         _current_user_id.reset(ctx_token)
 
-async def _do_get_market_data(symbol: str) -> str:
-    """Get market data - async business logic"""
-    client = await get_deriv_client()
-    try:
-        response = await client.get_ticks(symbol)
-        if 'error' in response:
-            return f"Error: {response['error']['message']}"
+_MARKET_CACHE: dict[str, tuple[float, str]] = {}
+_MARKET_CACHE_TTL = 4.0  # seconds — the TUI market panel polls 6 symbols every 5s;
+                         # cache so those don't each hit the broker every cycle.
 
-        tick_data = response.get('tick', {})
-        return f"Symbol: {symbol}\nPrice: {tick_data.get('quote', 'N/A')}\nTime: {tick_data.get('epoch', 'N/A')}"
-    finally:
-        pass
+
+async def _do_get_market_data(symbol: str) -> str:
+    """Get market data - async business logic (short-TTL cached per symbol)."""
+    import time
+    now = time.monotonic()
+    cached = _MARKET_CACHE.get(symbol)
+    if cached and (now - cached[0]) < _MARKET_CACHE_TTL:
+        return cached[1]
+    client = await get_deriv_client()
+    response = await client.get_ticks(symbol)
+    if 'error' in response:
+        return f"Error: {response['error']['message']}"
+    tick_data = response.get('tick', {})
+    result = f"Symbol: {symbol}\nPrice: {tick_data.get('quote', 'N/A')}\nTime: {tick_data.get('epoch', 'N/A')}"
+    _MARKET_CACHE[symbol] = (now, result)
+    return result
 
 @mcp.custom_route("/api/market-data/{symbol}", methods=["GET"])
 async def api_get_market_data(request: StarletteRequest) -> JSONResponse:
