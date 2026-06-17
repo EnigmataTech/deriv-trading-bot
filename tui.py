@@ -265,7 +265,7 @@ class DerivTradingApp(App):
     .sparkline-widget { width: 1fr; height: 3; }
 
     /* ── Open trades ───────────────────────── */
-    #open-trades-table { height: 12; }
+    #open-trades-table { height: 10; }
 
     /* ── Signals ───────────────────────────── */
     #signals-table { height: 9; }
@@ -286,7 +286,7 @@ class DerivTradingApp(App):
     }
 
     /* ── Agent activity ────────────────────── */
-    #agent-log { height: 1fr; min-height: 5; }
+    #agent-log { height: 2fr; min-height: 14; }
 
     /* ── Activity log ──────────────────────── */
     #activity-log { height: 8; min-height: 4; }
