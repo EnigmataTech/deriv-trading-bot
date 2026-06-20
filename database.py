@@ -2,7 +2,7 @@ import logging
 import os
 from dotenv import load_dotenv
 load_dotenv()
-from sqlalchemy import create_engine, Column, Integer, String, Text, Float, DateTime, Boolean
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, Float, DateTime, Boolean
 from sqlalchemy.exc import OperationalError, InterfaceError, DBAPIError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from typing import List, Optional
@@ -69,6 +69,13 @@ def migrate_database():
         },
     }
 
+    # Columns whose type must be *widened* on existing tables (ADD COLUMN above
+    # only creates missing columns, never alters an existing one). MT5 ticket
+    # numbers now exceed 2^31, so an old INTEGER mt5_ticket overflows on insert
+    # (NumericValueOutOfRange) — widen it to BIGINT. Postgres-only DDL.
+    widenings = {'trades': {'mt5_ticket': 'bigint'}}
+
+    is_postgres = engine.url.get_backend_name() == 'postgresql'
     with engine.connect() as conn:
         for table, cols in migrations.items():
             if table not in tables:
@@ -78,6 +85,17 @@ def migrate_database():
                 if col_name not in existing:
                     conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col_name} {col_type}'))
                     conn.commit()
+        if is_postgres:
+            for table, cols in widenings.items():
+                if table not in tables:
+                    continue
+                col_types = {c['name']: str(c['type']).lower() for c in inspector.get_columns(table)}
+                for col_name, target in cols.items():
+                    cur = col_types.get(col_name, '')
+                    if cur and 'bigint' not in cur and 'int' in cur:
+                        conn.execute(text(f'ALTER TABLE {table} ALTER COLUMN {col_name} TYPE {target}'))
+                        conn.commit()
+                        logger.info("Widened %s.%s %s -> %s", table, col_name, cur, target)
 
 
 # Run migration before create_all. Tolerate Postgres being unreachable at
@@ -109,7 +127,7 @@ class Trade(Base):
     trailing_stop_distance = Column(Float, nullable=True)  # Trailing stop distance in points
     trailing_stop_price = Column(Float, nullable=True)  # Current trailing stop price (moves up)
     highest_price_seen = Column(Float, nullable=True)  # Highest price since trade opened (for trailing)
-    mt5_ticket = Column(Integer, nullable=True, index=True)  # MT5 position/order ticket (BROKER=mt5)
+    mt5_ticket = Column(BigInteger, nullable=True, index=True)  # MT5 position/order ticket (BROKER=mt5); BIGINT — tickets exceed 2^31
     reason = Column(Text, nullable=True)  # Agent's stated rationale for the trade (Hermes)
     current_price = Column(Float, nullable=True)  # Live price, refreshed by the MT5 monitor
     unrealized_pnl = Column(Float, nullable=True)  # Live floating P&L, refreshed by the MT5 monitor
