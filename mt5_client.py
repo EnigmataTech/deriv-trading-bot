@@ -33,6 +33,47 @@ MT5_SYMBOLS = [
     "Volatility 100 (1s) Index",
 ]
 
+# MT5 under-reports trade_tick_value for Deriv synthetic indices (off by
+# 10-100×). One point (smallest price unit) = $1 per lot for these symbols,
+# so the correct tick_value = tick_size × (1.0 / point). The overrides below
+# precompute this for every volatility symbol the bot trades.
+DERIV_POINT_VALUE_PER_LOT = {
+    "Volatility 10 Index":     1.0,
+    "Volatility 25 Index":     1.0,
+    "Volatility 50 Index":     1.0,
+    "Volatility 75 Index":     1.0,
+    "Volatility 100 Index":    1.0,
+    "Volatility 10 (1s) Index":  1.0,
+    "Volatility 25 (1s) Index":  1.0,
+    "Volatility 50 (1s) Index":  1.0,
+    "Volatility 75 (1s) Index":  1.0,
+    "Volatility 100 (1s) Index": 1.0,
+}
+
+
+def _corrected_tick_value(symbol: str, raw_tick_value: float,
+                          tick_size: float, point: float) -> float:
+    """Override MT5's trade_tick_value for Deriv volatility indices.
+
+    MT5 under-reports tick_value for Deriv synthetic indices (off by 10-100×).
+    The correct value for volatility symbols is ~$1 per point per lot, so
+    tick_value = tick_size × (point_value_per_lot / point).
+
+    Falls back to raw_tick_value when the symbol isn't in the override map or
+    inputs are nonsensical (zero/negative).
+    """
+    pv = DERIV_POINT_VALUE_PER_LOT.get(symbol)
+    if pv is None:
+        return raw_tick_value
+    if point <= 0 or tick_size <= 0 or raw_tick_value <= 0:
+        return raw_tick_value
+    corrected = tick_size * (pv / point)
+    if abs(raw_tick_value - corrected) / max(corrected, 1e-12) < 0.01:
+        return raw_tick_value  # already correct, don't touch
+    logger.info("tick_value override %s: MT5=%.6f → corrected=%.6f (×%.1f)",
+                symbol, raw_tick_value, corrected, corrected / max(raw_tick_value, 1e-12))
+    return corrected
+
 
 def _load_creds() -> Dict[str, str]:
     creds = {}
@@ -220,7 +261,12 @@ class MT5Client:
                 "trade_allowed": getattr(si, "trade_mode", 0) != 0,
                 # Monetary value of one tick per 1.0 lot, and the tick size in
                 # price units — used for fixed-fractional (2%) position sizing.
-                "tick_value": float(getattr(si, "trade_tick_value", 0.0)),
+                "tick_value": _corrected_tick_value(
+                    symbol,
+                    float(getattr(si, "trade_tick_value", 0.0)),
+                    float(getattr(si, "trade_tick_size", 0.0)),
+                    float(getattr(si, "point", 0.0)),
+                ),
                 "tick_size": float(getattr(si, "trade_tick_size", 0.0)),
                 "contract_size": float(getattr(si, "trade_contract_size", 0.0)),
             }

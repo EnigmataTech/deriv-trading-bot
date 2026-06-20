@@ -23,8 +23,22 @@ def _is_conn_error(exc: Exception) -> bool:
     return False
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/trading")
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:***@localhost:5432/trading")
+# connect_timeout/statement_timeout are psycopg-only options; SQLite (used by the
+# test suite) rejects them, so only pass them for a Postgres URL.
+_connect_args = (
+    {
+        "connect_timeout": 5,            # fail fast when Postgres is unreachable
+        "options": "-c statement_timeout=10000",  # 10s query timeout, prevent slow-query hangs
+    }
+    if DATABASE_URL.startswith(("postgresql", "postgres"))
+    else {}
+)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args=_connect_args,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

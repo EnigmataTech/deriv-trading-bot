@@ -377,7 +377,11 @@ def check_max_drawdown(user_id: str) -> tuple[bool, Optional[str]]:
     from database import SessionLocal, Portfolio
     if MAX_DRAWDOWN_PCT <= 0:
         return True, None
-    db = SessionLocal()
+    try:
+        db = SessionLocal()
+    except Exception as e:
+        logger.warning("drawdown check skipped (Postgres unavailable): %s", e)
+        return True, None   # when data is unavailable, don't block trading
     try:
         pf = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
         if not pf or not pf.peak_equity or pf.peak_equity <= 0:
@@ -387,8 +391,14 @@ def check_max_drawdown(user_id: str) -> tuple[bool, Optional[str]]:
             return False, (f"Max drawdown {dd*100:.1f}% (peak ${pf.peak_equity:.2f} "
                            f"→ equity ${pf.equity:.2f})")
         return True, None
+    except Exception as e:
+        logger.warning("drawdown check error: %s", e)
+        return True, None   # on DB read error, allow trading (monitor will halt on next cycle)
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 def validate_symbol(symbol: str) -> tuple[Optional[str], Optional[str]]:
@@ -2742,6 +2752,11 @@ async def _autotrade_loop() -> None:
                 "stop=%.1f×ATR%d (floor %.2f%%), RR=%.1f, risk=%.1f%%/trade, maxDD=%.0f%%, symbols %s",
                 interval, timeframe, threshold, longs_only, ema_period, atr_mult, atr_period,
                 sl_floor_pct * 100, rr, risk_pct * 100, MAX_DRAWDOWN_PCT * 100, symbols)
+    # Startup heartbeat so we always know the autotrader came up.
+    await asyncio.to_thread(_notify_telegram,
+        f"🤖 Autotrader restarted | symbols: {', '.join(symbols)} | "
+        f"score >= +{threshold} | risk={risk_pct*100:.0f}%/trade | "
+        f"stop={atr_mult}xATR{atr_period} | maxDD={MAX_DRAWDOWN_PCT*100:.0f}%")
     await asyncio.sleep(10)  # let the bridge/monitor settle after startup
     dd_halted = False
     while True:
