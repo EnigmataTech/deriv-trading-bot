@@ -2,6 +2,10 @@
 .env
 .env.local
 .env.*.local
+.env.bak*
+
+# Reference data (account trade history kept locally, not versioned)
+reference/legacy-trades-*.csv
 
 # Virtual environment
 .venv/
