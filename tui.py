@@ -60,44 +60,10 @@ ALLOWED_SYMBOLS = sorted([
     # Crash/Boom removed 2026-06-17 — blacklisted on the bot (spike strategy failed)
 ])
 
-QUICK_TRADES: dict[str, tuple[str, str, float]] = {
-    "quick-call-r50":     ("CALL", "R_50",    1.00),
-    "quick-put-r50":      ("PUT",  "R_50",    1.00),
-    "quick-call-r100":    ("CALL", "R_100",   1.00),
-    "quick-put-r100":     ("PUT",  "R_100",   1.00),
-    "quick-call-1hz50v":  ("CALL", "1HZ50V",  1.00),
-    "quick-put-1hz50v":   ("PUT",  "1HZ50V",  1.00),
-    "quick-call-1hz100v": ("CALL", "1HZ100V", 1.00),
-    "quick-put-1hz100v":  ("PUT",  "1HZ100V", 1.00),
-}
-
-# (direction, symbol, amount, multiplier)
-QUICK_MULTIPLIERS: dict[str, tuple[str, str, float, int]] = {
-    "qm-buy-r50":     ("BUY",  "R_50",    1.00, 80),
-    "qm-sell-r50":    ("SELL", "R_50",    1.00, 80),
-    "qm-buy-r100":    ("BUY",  "R_100",   1.00, 40),
-    "qm-sell-r100":   ("SELL", "R_100",   1.00, 40),
-    "qm-buy-1hz50v":  ("BUY",  "1HZ50V",  1.00, 80),
-    "qm-sell-1hz50v": ("SELL", "1HZ50V",  1.00, 80),
-}
-
-SYMBOL_MULTIPLIERS: dict[str, list[int]] = {
-    # Standard volatility
-    "R_10":  [100, 200, 500],
-    "R_25":  [50, 100, 200],
-    "R_50":  [80, 200, 400, 600, 800],
-    "R_75":  [20, 50, 100],
-    "R_100": [40, 100, 200, 300, 400],
-    # 1-second volatility
-    "1HZ10V":  [100, 200, 500],
-    "1HZ15V":  [300, 1000, 1500, 2000, 3000],
-    "1HZ25V":  [50, 100, 200],
-    "1HZ30V":  [140, 400, 700, 1000, 1400],
-    "1HZ50V":  [80, 200, 400, 600, 800],
-    "1HZ75V":  [20, 50, 100],
-    "1HZ90V":  [45, 100, 200, 300, 450],
-    "1HZ100V": [40, 100, 200, 300, 400],
-}
+# Manual trading was removed from the TUI (2026-06-26, Phase 2): Hermes is the
+# sole trader. The quick-trade / multiplier / symbol-multiplier tables that drove
+# the old "Trade [2]" tab were deleted along with it. The /api/trade* endpoints
+# remain server-side because Hermes uses them.
 
 
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -154,17 +120,14 @@ def local_time(iso_str, fmt: str = "%Y-%m-%d %H:%M") -> str:
 class TradeDetailModal(ModalScreen):
     BINDINGS = [("escape", "dismiss", "Dismiss"), ("enter", "dismiss", "Dismiss")]
 
-    def __init__(self, trade: dict, on_close=None) -> None:
+    def __init__(self, trade: dict) -> None:
         super().__init__()
         self._trade = trade
-        self._on_close = on_close  # callback(trade_id) for closing a multiplier position
 
     def compose(self) -> ComposeResult:
         t = self._trade
         pnl = t.get("profit_loss") if t.get("profit_loss") is not None else t.get("unrealized_pnl")
         pnl_str = (f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}") if pnl is not None else "—"
-        is_open = t.get("status", "").lower() == "open"
-        is_multiplier = t.get("type", "").upper() in ("MULTUP", "MULTDOWN")
         is_mt5 = is_mt5_trade(t)
         size_label = "Lot Size" if is_mt5 else "Amount"
 
@@ -208,19 +171,11 @@ class TradeDetailModal(ModalScreen):
                 yield Static(str(reason), id="detail-reason")
             yield Rule()
             with Horizontal(id="modal-buttons"):
-                yield Button("✕  Close Position", id="modal-close-trade", variant="error",
-                             disabled=not is_open)
                 yield Button("Dismiss", id="modal-dismiss", variant="default")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "modal-dismiss":
             self.dismiss()
-        elif event.button.id == "modal-close-trade":
-            trade_id = str(self._trade.get("trade_id", ""))
-            callback = self._on_close
-            self.dismiss()
-            if callback:
-                await callback(trade_id)
 
 
 # ─── Main Application ─────────────────────────────────────────────────────────
@@ -292,26 +247,15 @@ class DerivTradingApp(App):
     #activity-log { height: 8; min-height: 4; }
 
     /* ── Trade form ────────────────────────── */
-    #trade-form { padding: 1 2; overflow-y: auto; height: 1fr; }
+    #agent-tab    { padding: 1 2; height: 1fr; }
+    #agent-stream { height: 1fr; margin-top: 1; }
     .section-header {
         color: $accent;
         text-style: bold;
-        height: 1;
+        height: auto;
         margin-bottom: 1;
     }
-    .quick-grid        { height: auto; }
-    .quick-grid Button { margin: 0 1 1 0; min-width: 20; }
-    .form-row          { height: 3; margin-bottom: 1; align: left middle; }
-    .form-label        { width: 14; content-align: right middle; padding-right: 2; }
     Select             { width: 1fr; }
-    .dir-btn           { width: 14; margin-right: 1; }
-    .mode-btn          { width: 18; margin-right: 1; }
-    .mult-btn          { width: 8; margin-right: 1; }
-    .amt-btn           { width: 7; margin-right: 1; }
-    #mult-row          { height: 3; margin-bottom: 1; align: left middle; }
-    #duration-row      { height: 3; margin-bottom: 1; align: left middle; }
-    #btn-place         { margin-top: 1; min-width: 28; }
-    #place-log         { height: 8; margin-top: 1; }
 
     /* ── History ───────────────────────────── */
     #history-table { height: 1fr; }
@@ -346,10 +290,9 @@ class DerivTradingApp(App):
 
     BINDINGS = [
         Binding("1", "switch_tab('tab-dashboard')", "Dashboard"),
-        Binding("2", "switch_tab('tab-place')",     "Trade"),
+        Binding("2", "switch_tab('tab-agent')",     "Agent"),
         Binding("3", "switch_tab('tab-history')",   "History"),
         Binding("4", "switch_tab('tab-chart')",     "Chart"),
-        Binding("c", "close_trade",         "Close Trade"),
         Binding("r", "refresh_all",         "Refresh"),
         Binding("a", "toggle_auto_refresh", "Auto"),
         Binding("ctrl+l", "clear_log",      "Clear Log"),
@@ -372,9 +315,6 @@ class DerivTradingApp(App):
         self._timer_agent: Optional[Timer] = None
         self._price_history: dict[str, list[float]] = {}
         self._open_trade_rows: dict[str, dict] = {}
-        self._trade_mode: str = "multiplier"  # "binary" or "multiplier"
-        self._trade_direction: str = "BUY"    # BUY/SELL for multiplier, CALL/PUT for binary
-        self._multiplier: int = 80
         self._modal_open: bool = False
         self._timer_ticks: Optional[Timer] = None
         self._mkt_col_price: Any = None
@@ -420,75 +360,17 @@ class DerivTradingApp(App):
                         yield RichLog(id="agent-log", markup=True, classes="panel", auto_scroll=False)
                 yield RichLog(id="activity-log", classes="panel", markup=True)
 
-            # ── Place Trade ────────────────────────────────────────────────
-            with TabPane("Trade  [2]", id="tab-place"):
-                with Vertical(id="trade-form"):
-                    yield Static("▸ Mode", classes="section-header")
-                    with Horizontal(classes="form-row"):
-                        yield Label("Type", classes="form-label")
-                        yield Button("✦ Multiplier", id="mode-multiplier", variant="primary",   classes="mode-btn")
-                        yield Button("  Binary Opt", id="mode-binary",     variant="default",   classes="mode-btn")
-                    yield Rule()
-                    yield Static("▸ Quick Trade", classes="section-header")
-                    with Horizontal(id="quick-mult-grid", classes="quick-grid"):
-                        yield Button("▲ BUY  R_50  $1 80x",  id="qm-buy-r50",     variant="success")
-                        yield Button("▼ SELL R_50  $1 80x",  id="qm-sell-r50",    variant="error")
-                        yield Button("▲ BUY  R_100 $1 40x",  id="qm-buy-r100",    variant="success")
-                        yield Button("▼ SELL R_100 $1 40x",  id="qm-sell-r100",   variant="error")
-                        yield Button("▲ BUY  1HZ50V $1 80x", id="qm-buy-1hz50v",  variant="success")
-                        yield Button("▼ SELL 1HZ50V $1 80x", id="qm-sell-1hz50v", variant="error")
-                    with Horizontal(id="quick-bin-grid", classes="quick-grid"):
-                        yield Button("▲ CALL  R_50  $1",  id="quick-call-r50",     variant="success")
-                        yield Button("▼ PUT   R_50  $1",  id="quick-put-r50",      variant="error")
-                        yield Button("▲ CALL  R_100 $1",  id="quick-call-r100",    variant="success")
-                        yield Button("▼ PUT   R_100 $1",  id="quick-put-r100",     variant="error")
-                        yield Button("▲ CALL 1HZ100V $1", id="quick-call-1hz100v", variant="success")
-                        yield Button("▼ PUT  1HZ100V $1", id="quick-put-1hz100v",  variant="error")
-                    yield Rule()
-                    yield Static("▸ Custom Trade", classes="section-header")
-                    with Horizontal(classes="form-row"):
-                        yield Label("Symbol", classes="form-label")
-                        yield Select(
-                            options=[(s, s) for s in ALLOWED_SYMBOLS],
-                            id="pt-symbol",
-                            value="R_50",
-                            allow_blank=False,
-                        )
-                    with Horizontal(classes="form-row"):
-                        yield Label("Direction", classes="form-label")
-                        yield Button("▲  BUY / CALL",  id="dir-call", variant="success", classes="dir-btn")
-                        yield Button("▼  SELL / PUT",  id="dir-put",  variant="default", classes="dir-btn")
-                    with Horizontal(classes="form-row"):
-                        yield Label("Amount ($)", classes="form-label")
-                        yield Input(placeholder="1.00", id="pt-amount", value="1.00", type="number")
-                    with Horizontal(classes="form-row"):
-                        yield Label("Presets", classes="form-label")
-                        yield Button("$0.35", id="amt-035", variant="default", classes="amt-btn")
-                        yield Button("$1",    id="amt-1",   variant="default", classes="amt-btn")
-                        yield Button("$2",    id="amt-2",   variant="default", classes="amt-btn")
-                        yield Button("$5",    id="amt-5",   variant="default", classes="amt-btn")
-                        yield Button("$10",   id="amt-10",  variant="default", classes="amt-btn")
-                        yield Button("$25",   id="amt-25",  variant="default", classes="amt-btn")
-                        yield Button("$50",   id="amt-50",  variant="default", classes="amt-btn")
-                    yield Static("", id="min-stake-note", classes="section-header")
-                    with Horizontal(id="mult-row", classes="form-row"):
-                        yield Label("Multiplier", classes="form-label")
-                        yield Button("80x",  id="mult-80",  variant="primary",  classes="mult-btn")
-                        yield Button("200x", id="mult-200", variant="default",  classes="mult-btn")
-                        yield Button("400x", id="mult-400", variant="default",  classes="mult-btn")
-                        yield Button("600x", id="mult-600", variant="default",  classes="mult-btn")
-                        yield Button("800x", id="mult-800", variant="default",  classes="mult-btn")
-                    with Horizontal(id="duration-row", classes="form-row"):
-                        yield Label("Duration (s)", classes="form-label")
-                        yield Input(placeholder="60", id="pt-duration", value="60", type="integer")
-                    with Horizontal(classes="form-row"):
-                        yield Label("Stop Loss ($)", classes="form-label")
-                        yield Input(placeholder="optional loss amount", id="pt-sl")
-                    with Horizontal(classes="form-row"):
-                        yield Label("Take Profit ($)", classes="form-label")
-                        yield Input(placeholder="optional profit amount", id="pt-tp")
-                    yield Button("▶  Place Trade", id="btn-place", variant="primary")
-                    yield RichLog(id="place-log", markup=True, classes="panel")
+            # ── Agent (observability; manual trading removed Phase 2) ──────────
+            with TabPane("Agent  [2]", id="tab-agent"):
+                with Vertical(id="agent-tab"):
+                    yield Static(
+                        "Hermes is the sole trader — this bot no longer places "
+                        "manual trades. The full per-scan reasoning stream lands "
+                        "here in a later phase.",
+                        id="agent-tab-note", classes="section-header",
+                    )
+                    yield RichLog(id="agent-stream", markup=True, classes="panel",
+                                  auto_scroll=False)
 
             # ── History ────────────────────────────────────────────────────
             with TabPane("History  [3]", id="tab-history"):
@@ -563,7 +445,6 @@ class DerivTradingApp(App):
         self.query_one("#portfolio-panel", Static).border_title = "Portfolio"
         self.query_one("#status-panel", Static).border_title   = "Status"
 
-        self.call_after_refresh(self._apply_mode)
         self._initialize_app()
 
     @work(exclusive=True, group="init")
@@ -1232,217 +1113,7 @@ class DerivTradingApp(App):
     async def refresh_signals(self) -> None:
         await self._fetch_signals()
 
-    async def _close_trade(self, trade_id: str) -> None:
-        """Close an open multiplier position."""
-        self._log(f"Closing #{trade_id}...")
-        try:
-            resp = await api_post(f"/api/trade/{trade_id}/sell", {})
-            if resp.get("success"):
-                pnl = resp.get("data", {}).get("profit_loss", 0)
-                sign = "+" if float(pnl) >= 0 else ""
-                self._log(f"[green]#{trade_id} closed: {sign}${float(pnl):.2f}[/green]")
-                self.notify(f"Closed #{trade_id}: {sign}${float(pnl):.2f}", severity="information", timeout=3)
-            else:
-                self._log(f"[red]Close failed: {resp.get('error')}[/red]")
-                self.notify(f"Close failed: {resp.get('error')}", severity="error", timeout=5)
-            self.refresh_open_trades()
-            self.refresh_history()
-            self.refresh_balance()
-        except Exception as e:
-            self._log(f"[red]Close error: {e}[/red]")
-
-    # ─── Trade placement ──────────────────────────────────────────────────────
-
-    async def _do_place_multiplier(
-        self,
-        symbol: str,
-        direction: str,
-        amount: float,
-        multiplier: int,
-        sl: Optional[float] = None,
-        tp: Optional[float] = None,
-    ) -> None:
-        self._log(f"Placing {direction} {symbol} ${amount:.2f} @ {multiplier}x...")
-        try:
-            body: dict = {
-                "symbol": symbol,
-                "direction": direction,
-                "amount": amount,
-                "multiplier": multiplier,
-            }
-            if sl is not None:
-                body["stop_loss"] = sl
-            if tp is not None:
-                body["take_profit"] = tp
-            resp = await api_post("/api/trade/multiplier", body)
-            if resp.get("success"):
-                msg = f"✅ {resp.get('data', 'Multiplier trade placed')}"
-                self._log(f"[bold green]{msg}[/bold green]")
-                self.notify(msg, severity="information", timeout=4)
-                self.refresh_open_trades()
-                self.set_timer(1.5, self.refresh_open_trades)
-                self.set_timer(4.0, self.refresh_open_trades)
-                self.refresh_balance()
-            else:
-                msg = f"❌ {resp.get('error', 'Trade failed')}"
-                self._log(f"[red]{msg}[/red]")
-                self.notify(msg, severity="error", timeout=5)
-        except Exception as e:
-            self._log(f"[red]Multiplier trade error: {e}[/red]")
-
-    async def _do_place_trade(
-        self,
-        symbol: str,
-        direction: str,
-        amount: float,
-        duration: int = 5,
-        sl: Optional[float] = None,
-        tp: Optional[float] = None,
-    ) -> None:
-        self._log(f"Placing {direction} {symbol} ${amount:.2f} dur={duration}t...")
-        try:
-            body: dict = {
-                "symbol": symbol,
-                "direction": direction,
-                "amount": amount,
-                "duration": duration,
-            }
-            if sl is not None:
-                body["stop_loss"] = sl
-            if tp is not None:
-                body["take_profit"] = tp
-
-            resp = await api_post("/api/trade", body)
-            if resp.get("success"):
-                msg = f"✅ {resp.get('data', 'Trade placed')}"
-                self._log(f"[bold green]{msg}[/bold green]")
-                self.notify(msg, severity="information", timeout=3)
-                self.refresh_open_trades()
-                self.set_timer(1.5, self.refresh_open_trades)
-                self.set_timer(4.0, self.refresh_open_trades)
-                self.refresh_balance()
-            else:
-                msg = f"❌ {resp.get('error', 'Trade failed')}"
-                self._log(f"[red]{msg}[/red]")
-                self.notify(msg, severity="error", timeout=5)
-        except Exception as e:
-            self._log(f"[red]Trade error: {e}[/red]")
-
     # ─── Event handlers ───────────────────────────────────────────────────────
-
-    def _apply_mode(self) -> None:
-        """Show/hide widgets based on current trade mode."""
-        try:
-            mult = self._trade_mode == "multiplier"
-            self.query_one("#mode-multiplier", Button).variant = "primary" if mult else "default"
-            self.query_one("#mode-binary",     Button).variant = "default" if mult else "primary"
-            self.query_one("#quick-mult-grid").display = mult
-            self.query_one("#quick-bin-grid").display  = not mult
-            self.query_one("#mult-row").display         = mult
-            self.query_one("#duration-row").display     = not mult
-            self.query_one("#amt-035").display          = not mult
-            self.query_one("#min-stake-note", Static).update(
-                "Min stake: $1.00" if mult else "Min stake: $0.35"
-            )
-            # Update direction button labels
-            call_btn = self.query_one("#dir-call", Button)
-            put_btn  = self.query_one("#dir-put",  Button)
-            call_btn.label = "▲  BUY"  if mult else "▲  CALL"
-            put_btn.label  = "▼  SELL" if mult else "▼  PUT"
-        except Exception:
-            pass
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-
-        # Trade mode toggle
-        if bid == "mode-multiplier":
-            self._trade_mode = "multiplier"
-            self._trade_direction = "BUY"
-            self.query_one("#dir-call", Button).variant = "success"
-            self.query_one("#dir-put",  Button).variant = "default"
-            self._apply_mode()
-            return
-        if bid == "mode-binary":
-            self._trade_mode = "binary"
-            self._trade_direction = "CALL"
-            self.query_one("#dir-call", Button).variant = "success"
-            self.query_one("#dir-put",  Button).variant = "default"
-            self._apply_mode()
-            return
-
-        # Direction toggle
-        if bid == "dir-call":
-            self._trade_direction = "BUY" if self._trade_mode == "multiplier" else "CALL"
-            self.query_one("#dir-call", Button).variant = "success"
-            self.query_one("#dir-put",  Button).variant = "default"
-            return
-        if bid == "dir-put":
-            self._trade_direction = "SELL" if self._trade_mode == "multiplier" else "PUT"
-            self.query_one("#dir-put",  Button).variant = "error"
-            self.query_one("#dir-call", Button).variant = "default"
-            return
-
-        # Amount presets
-        amt_map = {"amt-035": "0.35", "amt-1": "1.00", "amt-2": "2.00",
-                   "amt-5": "5.00", "amt-10": "10.00", "amt-25": "25.00", "amt-50": "50.00"}
-        if bid in amt_map:
-            self.query_one("#pt-amount", Input).value = amt_map[bid]
-            return
-
-        # Multiplier selector
-        if bid.startswith("mult-"):
-            try:
-                self._multiplier = int(bid.split("-")[1])
-                for m in [80, 200, 400, 600, 800]:
-                    try:
-                        self.query_one(f"#mult-{m}", Button).variant = "primary" if m == self._multiplier else "default"
-                    except Exception:
-                        pass
-            except (ValueError, IndexError):
-                pass
-            return
-
-        # Quick multiplier buttons
-        if bid in QUICK_MULTIPLIERS:
-            direction, symbol, amount, mult = QUICK_MULTIPLIERS[bid]
-            await self._do_place_multiplier(symbol, direction, amount, mult)
-            return
-
-        # Quick binary buttons
-        if bid in QUICK_TRADES:
-            direction, symbol, amount = QUICK_TRADES[bid]
-            await self._do_place_trade(symbol, direction, amount, duration=60)
-            return
-
-        if bid == "btn-place":
-            symbol_val = self.query_one("#pt-symbol", Select).value
-            symbol = str(symbol_val) if symbol_val is not Select.BLANK else ""
-            log = self.query_one("#place-log", RichLog)
-            if not symbol:
-                log.write("[red]Please select a symbol.[/red]")
-                return
-
-            amount_str = self.query_one("#pt-amount", Input).value.strip()
-            sl_str     = self.query_one("#pt-sl",     Input).value.strip()
-            tp_str     = self.query_one("#pt-tp",     Input).value.strip()
-            try:
-                amount = float(amount_str or "1.00")
-            except ValueError:
-                log.write("[red]Amount must be a number.[/red]")
-                return
-            sl = float(sl_str) if sl_str else None
-            tp = float(tp_str) if tp_str else None
-
-            if self._trade_mode == "multiplier":
-                await self._do_place_multiplier(symbol, self._trade_direction, amount, self._multiplier, sl, tp)
-            else:
-                duration_str = self.query_one("#pt-duration", Input).value.strip()
-                duration = int(duration_str) if duration_str else 60
-                await self._do_place_trade(symbol, self._trade_direction, amount, duration, sl, tp)
-
-            self.query_one("#pt-sl", Input).value = ""
-            self.query_one("#pt-tp", Input).value = ""
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.tab.id == "tab-history":
@@ -1465,30 +1136,12 @@ class DerivTradingApp(App):
         # or auto-generated keys — so this lookup is safe without an ID check
         trade = self._open_trade_rows.get(str(event.row_key.value))
         if trade:
-            self.push_screen(TradeDetailModal(trade, on_close=self._close_trade))
+            self.push_screen(TradeDetailModal(trade))
 
     # ─── Actions ─────────────────────────────────────────────────────────────
 
     def action_switch_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
-
-    async def action_close_trade(self) -> None:
-        """Close the currently highlighted row in the Open Positions table."""
-        try:
-            table = self.query_one("#open-trades-table", DataTable)
-            row_keys = list(table.rows.keys())
-            if not row_keys or table.cursor_row >= len(row_keys):
-                self._log("[yellow]No trade selected to close.[/yellow]")
-                return
-            rk = row_keys[table.cursor_row]
-            trade = self._open_trade_rows.get(str(rk.value))
-            if not trade:
-                self._log("[yellow]Select a row in Open Positions then press C.[/yellow]")
-                return
-            trade_id = str(trade.get("trade_id", ""))
-            await self._close_trade(trade_id)
-        except Exception as e:
-            self._log(f"[red]Close error: {e}[/red]")
 
     def action_scroll_down_table(self) -> None:
         try:
