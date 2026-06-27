@@ -906,9 +906,14 @@ class DerivTradingApp(App):
 
             entries: list[tuple] = []   # (x_index, price, glyph, color)
             exits: list[tuple] = []     # (x_index, price, color)
+            deals: list[tuple] = []     # (x0, y0, x1, y1, color) entry→exit connector
+            pnl_labels: list[tuple] = []# (x_index, price, text, color) value at exit
+            sltp_lines: list[tuple] = []# (price, color) SL/TP guides for open positions
             open_lines: list[float] = []
             n_open = n_closed = off_screen = sym_trades = 0
             recent_summary: Optional[str] = None
+            # small vertical nudge so P&L labels don't sit exactly on the ● glyph
+            y_pad = (max(data["High"]) - min(data["Low"])) * 0.03
             try:
                 tr = await api_get("/api/trades/agent")
                 if tr.get("success"):
@@ -923,12 +928,19 @@ class DerivTradingApp(App):
                             off_screen += 1
                             continue
                         ep = float(ep)
+                        ex0 = idx_of(ca)
                         is_up = str(t.get("type", "")).lower() in ("call", "buy", "multup")
                         sign = 1 if is_up else -1
-                        entries.append((idx_of(ca), ep, "▲" if is_up else "▼", "green" if is_up else "red"))
+                        entries.append((ex0, ep, "▲" if is_up else "▼", "green" if is_up else "red"))
                         if t.get("status") == "open":
                             n_open += 1
                             open_lines.append(ep)
+                            # SL/TP guide lines for the live position (price levels)
+                            sl, tp = t.get("stop_loss"), t.get("take_profit")
+                            if sl:
+                                sltp_lines.append((float(sl), "red"))
+                            if tp:
+                                sltp_lines.append((float(tp), "green"))
                             recent_summary = f"{'▲' if is_up else '▼'} open {(last - ep) * sign:+.2f} pts (floating)"
                         else:
                             n_closed += 1
@@ -936,8 +948,15 @@ class DerivTradingApp(App):
                             pnl = t.get("profit_loss")
                             if xp:
                                 xp = float(xp)
+                                win_color = "green" if (pnl or 0) >= 0 else "red"
                                 if cl and t0 <= cl <= t1:
-                                    exits.append((idx_of(cl), xp, "green" if (pnl or 0) >= 0 else "red"))
+                                    ex1 = idx_of(cl)
+                                    exits.append((ex1, xp, win_color))
+                                    # MT5 "deal" line: entry → exit, colored by outcome
+                                    deals.append((ex0, ep, ex1, xp, win_color))
+                                    if pnl is not None:
+                                        ly = xp + (y_pad if pnl >= 0 else -y_pad)
+                                        pnl_labels.append((ex1, ly, f"{pnl:+.2f}", win_color))
                                 pnl_s = f"${pnl:+.2f}" if pnl is not None else "?"
                                 recent_summary = f"{'▲' if is_up else '▼'} {(xp - ep) * sign:+.2f} pts → {pnl_s}"
             except Exception:
@@ -951,12 +970,18 @@ class DerivTradingApp(App):
             xs = list(range(n))
             plt.candlestick(xs, data)
             plt.horizontal_line(last, color="orange")           # live current price
+            for price, color in sltp_lines:                      # SL (red) / TP (green) for open positions
+                plt.horizontal_line(price, color=color)
             for y in open_lines:                                 # open-position entry price
                 plt.horizontal_line(y, color="cyan")
+            for x0, y0, x1, y1, color in deals:                  # entry→exit "deal" line, win/loss colored
+                plt.plot([x0, x1], [y0, y1], color=color)
             for x, price, glyph, color in entries:               # entry arrows at entry price
                 plt.text(glyph, x, price, color=color)
             for x, price, color in exits:                        # exit markers at exit price
                 plt.text("●", x, price, color=color)
+            for x, price, text, color in pnl_labels:             # P&L value at each closed exit
+                plt.text(text, x, price, color=color)
             # Time labels at ~6 evenly-spaced candle slots.
             if n:
                 step = max(1, n // 6)
