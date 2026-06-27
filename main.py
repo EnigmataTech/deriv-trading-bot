@@ -1482,6 +1482,35 @@ async def api_get_balance(request: StarletteRequest) -> JSONResponse:
     finally:
         _current_user_id.reset(ctx_token)
 
+@mcp.custom_route("/api/account/mode", methods=["GET"])
+async def api_get_account_mode(request: StarletteRequest) -> JSONResponse:
+    """Report which account the bot is actually connected to, verified from MT5
+    itself (not just config). Lets the TUI show DEMO vs LIVE unambiguously."""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
+    try:
+        client = await get_deriv_client()
+        # MT5 client carries verified account identity; Deriv path does not.
+        trade_mode = getattr(client, "trade_mode", None)
+        is_real = trade_mode == 2
+        data = {
+            "broker": BROKER,
+            "mode": getattr(client, "account_mode", "demo"),
+            "trade_mode": trade_mode,           # 0=demo, 1=contest, 2=real, None=n/a
+            "is_real_money": bool(is_real),
+            "login": getattr(client, "login", None),
+            "server": getattr(client, "server", None),
+            "currency": getattr(client, "currency", None),
+        }
+        log_api_call("/api/account/mode", "GET", 200)
+        return JSONResponse({"success": True, "data": data})
+    except Exception as e:
+        log_error(e, "api_get_account_mode")
+        return JSONResponse({"success": False, "error": "Failed to retrieve account mode"},
+                            status_code=500)
+
+
 _MARKET_CACHE: dict[str, tuple[float, str]] = {}
 _MARKET_CACHE_TTL = 4.0  # seconds — the TUI market panel polls 6 symbols every 5s;
                          # cache so those don't each hit the broker every cycle.

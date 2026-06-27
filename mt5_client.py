@@ -24,6 +24,16 @@ MT5_TERMINAL_PATH = os.getenv(
 )
 MT5_CREDS_FILE = os.getenv("MT5_CREDS_FILE", os.path.expanduser("~/.mt5creds"))
 
+# Demo/live account switch. The switch is a deliberate config flag + restart;
+# the mode is NEVER trusted from config alone — it is verified against the
+# account MT5 actually connects to (see _connect_sync). `demo` is the safe default.
+MT5_ACCOUNT_MODE = os.getenv("MT5_ACCOUNT_MODE", "demo").strip().lower()
+
+# account_info().trade_mode values (ACCOUNT_TRADE_MODE_*)
+TRADE_MODE_DEMO = 0
+TRADE_MODE_CONTEST = 1
+TRADE_MODE_REAL = 2
+
 # Canonical symbols = MT5 names. Default low-leverage synthetics the bot trades.
 MT5_SYMBOLS = [
     "Volatility 10 Index", "Volatility 25 Index", "Volatility 50 Index",
@@ -75,8 +85,18 @@ def _corrected_tick_value(symbol: str, raw_tick_value: float,
     return corrected
 
 
-def _load_creds() -> Dict[str, str]:
+def _load_creds(mode: str = None) -> Dict[str, str]:
+    """Resolve MT5 login creds for the given account mode ('demo'|'live').
+
+    Resolution order (later overrides earlier) keeps the legacy single-account
+    setup working while letting MT5_ACCOUNT_MODE select a dedicated cred block:
+      1. ~/.mt5creds          (legacy single block: LOGIN/PASSWORD/SERVER)
+      2. legacy env           MT5_LOGIN / MT5_PASSWORD / MT5_SERVER
+      3. mode-specific env     MT5_DEMO_* / MT5_LIVE_*   (authoritative)
+    """
+    mode = (mode or MT5_ACCOUNT_MODE)
     creds = {}
+    # 1. legacy file
     try:
         for line in open(MT5_CREDS_FILE):
             k, _, v = line.strip().partition("=")
@@ -84,10 +104,16 @@ def _load_creds() -> Dict[str, str]:
                 creds[k] = v
     except FileNotFoundError:
         pass
-    # env overrides
+    # 2. legacy env
     for k in ("LOGIN", "PASSWORD", "SERVER"):
         if os.getenv(f"MT5_{k}"):
             creds[k] = os.getenv(f"MT5_{k}")
+    # 3. mode-specific env (authoritative — wins over legacy)
+    prefix = "MT5_LIVE_" if mode == "live" else "MT5_DEMO_"
+    for k in ("LOGIN", "PASSWORD", "SERVER"):
+        v = os.getenv(f"{prefix}{k}")
+        if v:
+            creds[k] = v
     return creds
 
 
@@ -104,6 +130,12 @@ class MT5Client:
         self._mt5 = None            # mt5linux MetaTrader5 proxy
         self._tf_map: Dict[int, Any] = {}   # granularity seconds -> mt5 TIMEFRAME_*
         self._lock = asyncio.Lock()
+        # account identity, populated + verified on connect
+        self.account_mode = MT5_ACCOUNT_MODE   # configured: 'demo' | 'live'
+        self.trade_mode: Optional[int] = None  # verified from MT5: 0=demo,1=contest,2=real
+        self.login: Optional[int] = None
+        self.server: Optional[str] = None
+        self.currency: Optional[str] = None
 
     # ---- connection -----------------------------------------------------
     def _connect_sync(self) -> bool:
@@ -111,9 +143,9 @@ class MT5Client:
         mt5 = MetaTrader5(host=self.host, port=self.port)
         # Attach to the bridge-launched terminal (already logged in + algo-enabled
         # via mt5-startup.ini). Fall back to launching it ourselves if absent.
+        creds = _load_creds(self.account_mode)
         ok = mt5.initialize()
         if not ok:
-            creds = _load_creds()
             ok = mt5.initialize(
                 path=MT5_TERMINAL_PATH,
                 login=int(creds["LOGIN"]),
@@ -124,6 +156,48 @@ class MT5Client:
         if not ok:
             logger.error("MT5 initialize failed: %s", mt5.last_error())
             return False
+
+        # initialize() attaches to whatever account the bridge terminal is
+        # already logged into — which is NOT necessarily the one we want. Force
+        # a login to the selected mode's account so the demo/live switch is
+        # deliberate. (Falls back to the terminal's account if no creds block.)
+        if creds.get("LOGIN") and creds.get("PASSWORD") and creds.get("SERVER"):
+            if not mt5.login(int(creds["LOGIN"]), password=creds["PASSWORD"],
+                             server=creds["SERVER"]):
+                logger.error("MT5 login to %s account %s @ %s failed: %s",
+                             self.account_mode, creds["LOGIN"], creds["SERVER"],
+                             mt5.last_error())
+                return False
+        else:
+            logger.warning("MT5 %s mode: no MT5_%s_* creds block — using the "
+                           "terminal's pre-logged-in account; trade_mode is still verified.",
+                           self.account_mode, self.account_mode.upper())
+
+        # Verify the account MODE against MT5 itself — config is never trusted.
+        ai = mt5.account_info()
+        if ai is None:
+            logger.error("MT5 account_info() is None after login — refusing to connect.")
+            return False
+        self.trade_mode = int(getattr(ai, "trade_mode", -1))
+        self.login = int(getattr(ai, "login", 0))
+        self.server = str(getattr(ai, "server", ""))
+        self.currency = str(getattr(ai, "currency", ""))
+
+        want_real = (self.account_mode == "live")
+        is_real = (self.trade_mode == TRADE_MODE_REAL)
+        if want_real != is_real:
+            logger.error(
+                "MT5 ACCOUNT MODE MISMATCH: MT5_ACCOUNT_MODE=%s but connected "
+                "account %s @ %s reports trade_mode=%s (%s). REFUSING to connect "
+                "— fix creds/config before trading.",
+                self.account_mode, self.login, self.server, self.trade_mode,
+                "real" if is_real else "demo/contest")
+            return False
+
+        logger.warning("TRADE MODE: %s %s — acct %s @ %s (%s), trade_mode=%s",
+                       self.account_mode.upper(),
+                       "(REAL MONEY)" if is_real else "(demo)",
+                       self.login, self.server, self.currency, self.trade_mode)
         self._mt5 = mt5
         self._tf_map = {
             60: mt5.TIMEFRAME_M1, 300: mt5.TIMEFRAME_M5,
