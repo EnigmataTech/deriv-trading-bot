@@ -10,7 +10,7 @@ import os
 # CI/dev; the gate helper itself is pure.
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
-from main import _autotrade_side, _atr_from_ohlc, _size_position
+from main import _autotrade_side, _atr_from_ohlc, _size_position, _loss_at_stop
 
 
 class TestLongsOnlyGate:
@@ -74,3 +74,27 @@ class TestPositionSizing:
 
     def test_missing_tick_data_returns_none(self):
         assert _size_position(10000, 0.02, 10, 0.0, 0.0, 0.01, 100, 0.01) is None
+
+
+class TestAffordabilityGate:
+    """The dollar risk-at-stop used by the autotrader's balance-aware symbol gate."""
+
+    def test_basic_risk(self):
+        # 1 lot, stop 10, tick_value 1, tick_size 1 -> $10 risk
+        assert _loss_at_stop(1.0, 10, 1.0, 1.0) == 10.0
+
+    def test_scales_with_lot(self):
+        assert _loss_at_stop(0.1, 10, 1.0, 1.0) == 1.0
+
+    def test_invalid_inputs_return_zero(self):
+        # 0 means "can't price it" -> caller does not gate
+        assert _loss_at_stop(0.0, 10, 1.0, 1.0) == 0.0
+        assert _loss_at_stop(1.0, 10, 0.0, 0.0) == 0.0
+
+    def test_small_account_would_skip_high_notional(self):
+        # min-lot 1HZ25V-like: stop ~1000 pts, tick_value 1, tick_size 1, 0.1 lot
+        # -> ~$100 risk. On a $50 account at 5% cap ($2.50), this must be skipped.
+        risk = _loss_at_stop(0.1, 1000, 1.0, 1.0)
+        assert risk == 100.0
+        assert risk > 0.05 * 50          # gate trips -> skip
+        assert risk <= 0.05 * 8367.65    # affordable on the demo -> allowed

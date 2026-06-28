@@ -2755,6 +2755,16 @@ def _size_position(balance: float, risk_pct: float, stop_dist: float,
     return round(lot, decimals)
 
 
+def _loss_at_stop(lot: float, stop_dist: float,
+                  tick_value: float, tick_size: float) -> float:
+    """Dollar loss if `lot` is stopped out `stop_dist` away. Mirrors the
+    loss-per-lot formula in `_size_position`. Returns 0.0 on invalid inputs
+    (caller treats 0 as "can't price the risk" → does not gate on it)."""
+    if min(lot, stop_dist, tick_value, tick_size) <= 0:
+        return 0.0
+    return (stop_dist / tick_size) * tick_value * lot
+
+
 async def _autotrade_loop() -> None:
     """Deterministic (no-LLM) autotrader. Scans configured symbols on an interval,
     places a min-lot MT5 trade when |composite_score| >= threshold (reusing the
@@ -2771,10 +2781,14 @@ async def _autotrade_loop() -> None:
     atr_mult = float(os.getenv("AUTOTRADE_ATR_MULT", "1.5"))   # stop = atr_mult × ATR
     ema_period = int(os.getenv("AUTOTRADE_EMA_PERIOD", "50"))  # trend filter; 0 disables
     risk_pct = float(os.getenv("AUTOTRADE_RISK_PCT", "0.02"))  # fixed-fractional risk/trade; 0 ⇒ min lot
+    # Affordability ceiling: skip a symbol when even its smallest tradeable lot
+    # would risk more than this fraction of balance. Makes the symbol universe
+    # self-select by account size (a $50 account can't afford a min-lot 1HZ25V).
+    max_risk_pct = float(os.getenv("AUTOTRADE_MAX_RISK_PCT", "0.05"))
     timeframe = int(os.getenv("AUTOTRADE_TIMEFRAME", "900"))   # signal candle granularity (900=M15)
     longs_only = os.getenv("AUTOTRADE_LONGS_ONLY", "true").lower() == "true"
     symbols = [s.strip() for s in os.getenv(
-        "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V").split(",") if s.strip()]
+        "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V,1HZ25V").split(",") if s.strip()]
     user_id = get_user_id()
     need_bars = max(35, ema_period + 1, atr_period + 1)
     logger.info("Autotrader ON: every %ds, tf=%ds, score>=+%d, longs_only=%s, EMA%d trend, "
@@ -2878,6 +2892,21 @@ async def _autotrade_loop() -> None:
                         vmin, vmax, vstep)
                     if sized:
                         lot = sized
+
+                # Affordability gate: _size_position floors UP to the broker min
+                # lot, so on a small account a min-lot trade on a high-notional
+                # symbol can risk far more than the account holds. Skip the symbol
+                # when the chosen lot's risk-at-stop exceeds max_risk_pct of balance.
+                if balance > 0 and max_risk_pct > 0:
+                    risk_at_stop = _loss_at_stop(
+                        lot, sl_dist,
+                        specs.get("tick_value", 0.0), specs.get("tick_size", 0.0))
+                    if risk_at_stop > max_risk_pct * balance:
+                        logger.info(
+                            "Autotrade skip %s: min-lot risk $%.2f > %.0f%% of $%.2f balance",
+                            name, risk_at_stop, max_risk_pct * 100, balance)
+                        continue
+
                 if max_lot > 0 and lot > max_lot:
                     logger.info("Autotrade skip %s: sized lot %.4f > max_lot %.4f", name, lot, max_lot)
                     continue
