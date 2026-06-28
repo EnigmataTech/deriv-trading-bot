@@ -132,6 +132,27 @@ class Trade(Base):
     current_price = Column(Float, nullable=True)  # Live price, refreshed by the MT5 monitor
     unrealized_pnl = Column(Float, nullable=True)  # Live floating P&L, refreshed by the MT5 monitor
 
+class AgentActivity(Base):
+    """Per-scan observability record emitted by the trading agent (Hermes).
+
+    Unlike Trade rows — written only when an order actually fires — this captures
+    EVERY scan, including the ~90% that decide [SILENT]. It makes the agent's
+    reasoning visible in the TUI even when it does nothing. This is observability,
+    not a financial record, so writes are best-effort (dropped on a Postgres
+    outage rather than buffered to the outbox)."""
+    __tablename__ = "agent_activity"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    agent = Column(String, nullable=False, default="hermes", index=True)
+    event_type = Column(String, nullable=False, default="scan")  # scan|signal|trade|error|heartbeat
+    symbol = Column(String, nullable=True)
+    score = Column(Float, nullable=True)               # composite score at scan time
+    decision = Column(String, nullable=True)           # BUY|SELL|SILENT|HOLD|...
+    detail = Column(Text, nullable=True)               # human-readable reasoning
+    trade_id = Column(String, nullable=True, index=True)  # links to Trade.trade_id when a trade fired
+
+
 class Portfolio(Base):
     __tablename__ = "portfolios"
 
@@ -545,5 +566,51 @@ class TradingRepository:
             if user_id is not None:
                 query = query.filter(Trade.user_id == user_id)
             return query.all()
+        finally:
+            db.close()
+
+    @staticmethod
+    def record_agent_activity(event_type: str, agent: str = "hermes",
+                              symbol: Optional[str] = None, score: Optional[float] = None,
+                              decision: Optional[str] = None, detail: Optional[str] = None,
+                              trade_id: Optional[str] = None,
+                              ts: Optional[datetime] = None) -> Optional["AgentActivity"]:
+        """Persist one per-scan observability record. Best-effort: a Postgres
+        connection outage is swallowed (this is observability, not a financial
+        record, so we'd rather drop it than buffer); data/logic errors surface."""
+        db = SessionLocal()
+        try:
+            row = AgentActivity(
+                agent=agent or "hermes",
+                event_type=event_type or "scan",
+                symbol=symbol, score=score, decision=decision,
+                detail=detail, trade_id=trade_id,
+                ts=ts or datetime.utcnow(),
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row
+        except Exception as e:
+            db.rollback()
+            if _is_conn_error(e):
+                logger.warning("agent_activity write dropped — Postgres unreachable: %s", e)
+                return None
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def get_recent_agent_activity(limit: int = 100, agent: Optional[str] = None,
+                                  since: Optional[datetime] = None) -> List["AgentActivity"]:
+        """Most-recent-first activity records for the TUI stream."""
+        db = SessionLocal()
+        try:
+            query = db.query(AgentActivity)
+            if agent:
+                query = query.filter(AgentActivity.agent == agent)
+            if since is not None:
+                query = query.filter(AgentActivity.ts > since)
+            return query.order_by(AgentActivity.ts.desc()).limit(limit).all()
         finally:
             db.close()

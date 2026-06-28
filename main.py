@@ -5,6 +5,7 @@ from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse, Response, HTMLResponse
+from datetime import datetime
 from database import TradingRepository
 from indicators import TechnicalIndicators
 from symbols import get_symbol_display_name
@@ -2410,6 +2411,78 @@ def api_agent_trades(request: StarletteRequest) -> JSONResponse:
     except Exception as e:
         log_error(e, "api_agent_trades")
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/agent/activity", methods=["POST"])
+async def api_post_agent_activity(request: StarletteRequest) -> JSONResponse:
+    """Hermes posts one per-scan observability record so silent scans are visible.
+    Body: {event_type, symbol?, score?, decision?, detail?, trade_id?, agent?, ts?}
+    — event_type defaults to 'scan'. Best-effort persistence (dropped on a
+    Postgres outage). Auth mirrors the other write endpoints."""
+    user_id, error_response = require_auth(request)
+    if error_response:
+        return error_response
+    try:
+        body = await request.json()
+
+        ts = None
+        ts_raw = body.get("ts")
+        if ts_raw:
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                ts = None  # fall back to server time
+
+        score = body.get("score")
+        try:
+            score = float(score) if score is not None else None
+        except (ValueError, TypeError):
+            score = None
+
+        def _s(key):
+            v = body.get(key)
+            return str(v) if v is not None and str(v) != "" else None
+
+        row = TradingRepository.record_agent_activity(
+            event_type=str(body.get("event_type") or "scan"),
+            agent=str(body.get("agent") or MCP_AGENT_USER_ID),
+            symbol=_s("symbol"), score=score,
+            decision=_s("decision"), detail=_s("detail"),
+            trade_id=_s("trade_id"), ts=ts,
+        )
+        log_api_call("/api/agent/activity", "POST", 200)
+        return JSONResponse({"success": True, "id": row.id if row else None})
+    except Exception as e:
+        log_error(e, "api_post_agent_activity")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/agent/activity", methods=["GET"])
+def api_get_agent_activity(request: StarletteRequest) -> JSONResponse:
+    """Recent per-scan agent activity for the TUI stream — no auth (read-only,
+    mirrors /api/trades/agent). Query: ?limit=N (default 100, max 500)."""
+    try:
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", 100)), 500))
+        except (ValueError, TypeError):
+            limit = 100
+        rows = TradingRepository.get_recent_agent_activity(limit=limit)
+        activity = [{
+            "id": r.id,
+            "ts": r.ts.isoformat() if r.ts else None,
+            "agent": r.agent,
+            "event_type": r.event_type,
+            "symbol": r.symbol,
+            "score": r.score,
+            "decision": r.decision,
+            "detail": r.detail,
+            "trade_id": r.trade_id,
+        } for r in rows]
+        return JSONResponse({"success": True, "activity": activity})
+    except Exception as e:
+        log_error(e, "api_get_agent_activity")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
 
 @mcp.custom_route("/api/trades/open", methods=["GET"])
 async def api_open_trades(request: StarletteRequest) -> JSONResponse:

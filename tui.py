@@ -363,12 +363,8 @@ class DerivTradingApp(App):
             # ── Agent (observability; manual trading removed Phase 2) ──────────
             with TabPane("Agent  [2]", id="tab-agent"):
                 with Vertical(id="agent-tab"):
-                    yield Static(
-                        "Hermes is the sole trader — this bot no longer places "
-                        "manual trades. The full per-scan reasoning stream lands "
-                        "here in a later phase.",
-                        id="agent-tab-note", classes="section-header",
-                    )
+                    yield Static("Hermes — waiting for activity…",
+                                 id="agent-summary", classes="section-header")
                     yield RichLog(id="agent-stream", markup=True, classes="panel",
                                   auto_scroll=False)
 
@@ -468,6 +464,8 @@ class DerivTradingApp(App):
         await self._fetch_open_trades()
         await self._fetch_market_data()
         await self._fetch_agent_activity()
+        await self._fetch_agent_stream()
+        await self._fetch_agent_summary()
         await self._fetch_history()
         await self._fetch_signals()
         await self._fetch_edge()
@@ -827,9 +825,87 @@ class DerivTradingApp(App):
         except Exception as e:
             self._log(f"[yellow]Activity feed error: {e}[/yellow]")
 
+    async def _fetch_agent_stream(self) -> None:
+        """Render the full per-scan reasoning stream (Phase 4) into the Agent tab —
+        every scan including the silent ones, so the agent's decisions are visible
+        even when it places no trade."""
+        try:
+            resp = await api_get("/api/agent/activity?limit=100")
+            log = self.query_one("#agent-stream", RichLog)
+            prev_y = log.scroll_y
+            at_bottom = (log.max_scroll_y - log.scroll_y) <= 1
+            log.clear()
+            if not resp.get("success"):
+                log.write("[dim]Activity endpoint unavailable[/dim]")
+                return
+            items = resp.get("activity", [])
+            if not items:
+                log.write("[dim]No agent activity recorded yet.[/dim]")
+                log.write("[dim]Hermes scans every ~10 min; per-scan records land here.[/dim]")
+                return
+            # API returns newest-first; render oldest-first so the newest is at the bottom.
+            for a in reversed(items):
+                ts = local_time(a.get("ts"), "%H:%M:%S")
+                etype = (a.get("event_type") or "scan").lower()
+                sym = a.get("symbol") or ""
+                score = a.get("score")
+                decision = (a.get("decision") or "").upper()
+                detail = a.get("detail") or ""
+                if decision in ("BUY", "CALL", "MULTUP", "LONG"):
+                    dcol = "bold green"
+                elif decision in ("SELL", "PUT", "MULTDOWN", "SHORT"):
+                    dcol = "bold red"
+                elif etype == "error":
+                    dcol = "bold yellow"
+                else:
+                    dcol = "dim"
+                icon = {"trade": "◆", "signal": "▸", "error": "✕",
+                        "heartbeat": "♥"}.get(etype, "·")
+                line = f"[dim]{ts}[/dim] {icon}"
+                if sym:
+                    line += f" [bold]{sym}[/bold]"
+                if isinstance(score, (int, float)):
+                    line += f" [cyan]{score:+.1f}[/cyan]"
+                if decision:
+                    line += f" [{dcol}]{decision}[/{dcol}]"
+                log.write(line)
+                if detail:
+                    log.write(f"   [dim italic]↳ {str(detail)[:140]}[/dim italic]")
+            self.call_after_refresh(
+                lambda: log.scroll_end(animate=False) if at_bottom
+                else log.scroll_to(y=prev_y, animate=False)
+            )
+        except Exception as e:
+            self._log(f"[yellow]Agent stream error: {e}[/yellow]")
+
+    async def _fetch_agent_summary(self) -> None:
+        """Win/loss summary strip atop the Agent tab, reusing /api/portfolio/stats."""
+        try:
+            resp = await api_get("/api/portfolio/stats")
+            if not resp.get("success"):
+                return
+            s = resp.get("stats", {})
+            w = s.get("winning_trades", 0)
+            l = s.get("losing_trades", 0)
+            wr = s.get("win_rate", 0)
+            net = s.get("total_pnl", 0) or 0
+            openn = s.get("open_trades", 0)
+            ncol = "green" if net >= 0 else "red"
+            self.query_one("#agent-summary", Static).update(
+                f"[bold]Hermes[/bold]   "
+                f"W [green]{w}[/green] / L [red]{l}[/red]   "
+                f"win-rate [bold]{wr}%[/bold]   "
+                f"net [{ncol}]{net:+.2f}[/{ncol}]   "
+                f"open [cyan]{openn}[/cyan]"
+            )
+        except Exception:
+            pass
+
     @work(exclusive=True, group="agent_activity")
     async def refresh_agent_activity(self) -> None:
         await self._fetch_agent_activity()
+        await self._fetch_agent_stream()
+        await self._fetch_agent_summary()
 
     # ─── Chart ───────────────────────────────────────────────────────────────
 
