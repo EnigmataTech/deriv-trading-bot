@@ -973,6 +973,40 @@ async def place_mt5_trade(
     )
 
 @mcp.tool()
+def record_agent_activity(
+    symbol: str = "",
+    score: float = None,
+    decision: str = "",
+    detail: str = "",
+    event_type: str = "scan",
+    trade_id: str = "",
+) -> str:
+    """Log one per-scan observability record so the agent's reasoning is visible
+    in the TUI even when no trade is placed. Call this once per symbol evaluated
+    (including SILENT/no-trade ones), so silent scans leave a record too.
+
+    Args:
+        symbol: Symbol evaluated, e.g. "R_75" or "Volatility 75 Index".
+        score: Composite signal score at scan time (e.g. 1, -2).
+        decision: What was decided — BUY, SELL, SILENT, or HOLD.
+        detail: One-line human-readable rationale.
+        event_type: "scan" (default), "trade", "error", or "heartbeat".
+        trade_id: Trade id/ticket when this record corresponds to a placed trade.
+    """
+    try:
+        sc = float(score) if score is not None else None
+    except (ValueError, TypeError):
+        sc = None
+    row = TradingRepository.record_agent_activity(
+        event_type=(event_type or "scan"),
+        agent=MCP_AGENT_USER_ID,
+        symbol=(symbol or None), score=sc,
+        decision=(decision or None), detail=(detail or None),
+        trade_id=(trade_id or None),
+    )
+    return f"Recorded activity #{row.id}" if row else "Activity dropped (db unavailable)"
+
+@mcp.tool()
 def get_trade_history() -> str:
     """Get trading history for the current user"""
     return _do_get_trade_history()
@@ -2861,7 +2895,7 @@ async def _autotrade_loop() -> None:
     timeframe = int(os.getenv("AUTOTRADE_TIMEFRAME", "900"))   # signal candle granularity (900=M15)
     longs_only = os.getenv("AUTOTRADE_LONGS_ONLY", "true").lower() == "true"
     symbols = [s.strip() for s in os.getenv(
-        "AUTOTRADE_SYMBOLS", "R_75,R_100,R_25,R_10,1HZ50V,1HZ25V").split(",") if s.strip()]
+        "AUTOTRADE_SYMBOLS", "R_75").split(",") if s.strip()]
     user_id = get_user_id()
     need_bars = max(35, ema_period + 1, atr_period + 1)
     logger.info("Autotrader ON: every %ds, tf=%ds, score>=+%d, longs_only=%s, EMA%d trend, "
