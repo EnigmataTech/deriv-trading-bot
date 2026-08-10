@@ -287,11 +287,13 @@ class MT5Client:
             return {"error": {"message": str(e)}}
 
     async def get_ticks_history(self, symbol: str, count: int = 100) -> Dict[str, Any]:
-        """Price series for signal computation. Uses M1 closes (robust; the
-        indicators only need a clean recent series)."""
+        """Price series for signal computation. Uses M15 closes — research
+        (2026-06-16, see synthetic-index-strategy-research memory) found M1
+        too noisy for reliable pattern/indicator signals; M15 is the
+        validated timeframe."""
         def _f(mt5):
             self._select(mt5, symbol)
-            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, count)
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, count)
             if rates is None:
                 return {"error": {"message": f"no history for {symbol}"}}
             return {"history": {

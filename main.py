@@ -780,16 +780,20 @@ async def _get_signal_cached(symbol: str) -> dict:
 
 
 def _compute_market_signal(symbol: str, prices: list) -> dict:
-    """Score-based composite signal: RSI / MACD-hist / BB-position summed to BUY/SELL/HOLD.
+    """Score-based composite signal: RSI / MACD-hist / BB-position summed to BUY/SELL/HOLD,
+    gated by a 50-EMA trend filter (longs only above EMA — the one component every
+    source in 2026-06-16 research agreed on). Also returns ATR-based suggested SL/TP
+    (1.5x ATR stop, 2:1 reward) for the caller to attach to a live order.
     Caller is responsible for applying the streak-risk pause override."""
-    if len(prices) < 35:
+    if len(prices) < 55:
         return {
             "symbol": symbol,
             "current_price": prices[-1] if prices else None,
-            "rsi": None, "macd": None, "bb": None,
+            "rsi": None, "macd": None, "bb": None, "ema50": None, "atr": None,
             "composite_score": 0,
             "call": "HOLD",
-            "reason": f"insufficient ticks ({len(prices)} < 35)",
+            "reason": f"insufficient bars ({len(prices)} < 55)",
+            "suggested_sl": None, "suggested_tp": None,
         }
 
     current = prices[-1]
@@ -845,6 +849,12 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
     else:
         bb_score, bb_pos = 0, "within"
 
+    ema_vals = TechnicalIndicators.calculate_ema(prices, 50)
+    ema50 = next((x for x in reversed(ema_vals) if x is not None), None)
+
+    atr_vals = TechnicalIndicators.calculate_atr(prices, 14)
+    atr = next((x for x in reversed(atr_vals) if x is not None), None)
+
     score = rsi_score + macd_score + bb_score
     if score >= 2:
         call = "BUY"
@@ -852,6 +862,20 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
         call = "SELL"
     else:
         call = "HOLD"
+
+    trend_note = None
+    # 50-EMA trend filter — only long above the EMA. The single component
+    # every source in the 2026-06-16 research converged on; applied to BUY
+    # only since the bot is longs-only elsewhere too.
+    if call == "BUY" and ema50 is not None and current <= ema50:
+        call = "HOLD"
+        trend_note = f"BUY blocked by trend filter — price {current:.2f} below 50-EMA {ema50:.2f}"
+
+    suggested_sl = suggested_tp = None
+    if call == "BUY" and atr is not None and atr > 0:
+        stop_dist = 1.5 * atr
+        suggested_sl = round(current - stop_dist, 5)
+        suggested_tp = round(current + stop_dist * 2, 5)  # 2:1 reward:risk
 
     reason_parts = []
     if rsi_label not in ("neutral", "n/a"):
@@ -861,6 +885,8 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
     if bb_pos not in ("within", "n/a"):
         reason_parts.append(f"price {bb_pos} BB")
     reason = ", ".join(reason_parts) if reason_parts else "no directional bias"
+    if trend_note:
+        reason = trend_note
 
     return {
         "symbol": symbol,
@@ -868,9 +894,13 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
         "rsi": {"value": rsi_latest, "score": rsi_score, "label": rsi_label},
         "macd": {"hist": hist_latest, "score": macd_score, "label": macd_label},
         "bb": {"position": bb_pos, "score": bb_score, "upper": u, "lower": l},
+        "ema50": ema50,
+        "atr": atr,
         "composite_score": score,
         "call": call,
         "reason": reason,
+        "suggested_sl": suggested_sl,
+        "suggested_tp": suggested_tp,
     }
 
 
@@ -1482,9 +1512,22 @@ async def get_market_signal(symbol: str) -> str:
     if pause["recommend_pause"]:
         sig["call"] = "HOLD"
         sig["reason"] = f"streak-risk pause ({pause['reason']})"
+        sig["suggested_sl"] = sig["suggested_tp"] = None
 
     if sig.get("rsi") is None:
         return f"Signal for {symbol}: HOLD ({sig['reason']})"
+
+    trend_line = ""
+    if sig.get("ema50") is not None:
+        trend_line = f"50-EMA:  {sig['ema50']:.5f}  (price {'above' if sig['current_price'] > sig['ema50'] else 'at/below'})\n"
+
+    sl_tp_line = ""
+    if sig["call"] == "BUY" and sig.get("suggested_sl") is not None:
+        sl_tp_line = (
+            f"ATR(14): {sig['atr']:.5f}\n"
+            f"Suggested SL: {sig['suggested_sl']}   Suggested TP: {sig['suggested_tp']}"
+            f"  (1.5x ATR stop, 2:1 reward — pass these to the live order, don't invent your own)\n"
+        )
 
     return (
         f"=== Signal for {symbol} ===\n"
@@ -1492,8 +1535,10 @@ async def get_market_signal(symbol: str) -> str:
         f"RSI:     {sig['rsi']['value']:.2f} [{sig['rsi']['label']}]  ({sig['rsi']['score']:+d})\n"
         f"MACD-h:  {sig['macd']['hist']:+.5f} [{sig['macd']['label']}]  ({sig['macd']['score']:+d})\n"
         f"BB-pos:  {sig['bb']['position']}  ({sig['bb']['score']:+d})\n"
+        f"{trend_line}"
         f"Score:   {sig['composite_score']:+d}\n"
         f"Call:    {sig['call']}\n"
+        f"{sl_tp_line}"
         f"Why:     {sig['reason']}"
     )
 
