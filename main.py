@@ -208,6 +208,10 @@ async def _app_lifespan(server):
         bg_tasks.append(asyncio.create_task(_balance_snapshot_loop()))
         # Deterministic no-LLM autotrader (self-gates on AUTOTRADE_ENABLED).
         bg_tasks.append(asyncio.create_task(_autotrade_loop()))
+        # Syncs closed real-money trades from the kreation bridge into Postgres
+        # (self-gates on MT5_BRIDGE_URL/MT5_BRIDGE_TOKEN being set).
+        from live_trade_sync import live_trade_sync_loop
+        bg_tasks.append(asyncio.create_task(live_trade_sync_loop()))
     try:
         yield
     finally:
@@ -2456,6 +2460,7 @@ def api_trades_list(request: StarletteRequest) -> JSONResponse:
                 "reason": trade.reason,
                 "created_at": trade.created_at.isoformat() if trade.created_at else None,
                 "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
+                "account_type": trade.account_type,
             })
         return JSONResponse({"success": True, "trades": trade_list})
     except Exception as e:

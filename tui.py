@@ -474,7 +474,7 @@ class DerivTradingApp(App):
         st.border_title = "Signals  (RSI / MACD / BB → composite)"
 
         ht = self.query_one("#history-table", DataTable)
-        ht.add_columns("ID", "Symbol", "Dir", "Size", "Entry", "Exit", "P&L", "Closed")
+        ht.add_columns("ID", "Acct", "Symbol", "Dir", "Size", "Entry", "Exit", "P&L", "Closed")
         ht.border_title = "Trade History"
         self.query_one("#edge-panel", Static).border_title = "Signal Edge"
 
@@ -808,8 +808,12 @@ class DerivTradingApp(App):
                 entry = t.get("entry_price") or 0
                 entry_str = f"{entry:.5f}" if entry else "—"
 
+                is_live = t.get("account_type") == "live"
+                acct_text = Text("LIVE", style="bold red") if is_live else Text("demo", style="dim")
+
                 table.add_row(
                     f"…{trade_id[-6:]}",
+                    acct_text,
                     symbol,
                     dir_text,
                     size_text(t),

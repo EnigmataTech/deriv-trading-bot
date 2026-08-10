@@ -131,6 +131,7 @@ class Trade(Base):
     reason = Column(Text, nullable=True)  # Agent's stated rationale for the trade (Hermes)
     current_price = Column(Float, nullable=True)  # Live price, refreshed by the MT5 monitor
     unrealized_pnl = Column(Float, nullable=True)  # Live floating P&L, refreshed by the MT5 monitor
+    account_type = Column(String, nullable=False, default='demo', index=True)  # 'demo' | 'live' — live rows synced from the kreation bridge, see live_trade_sync.py
 
 class AgentActivity(Base):
     """Per-scan observability record emitted by the trading agent (Hermes).
@@ -385,6 +386,44 @@ class TradingRepository:
         db = SessionLocal()
         try:
             return db.query(Trade).filter(Trade.trade_id == trade_id).first()
+        finally:
+            db.close()
+
+    @staticmethod
+    def upsert_closed_live_trade(
+        user_id: str, mt5_ticket: int, symbol: str, trade_type: str,
+        amount: float, entry_price: float, exit_price: float, profit_loss: float,
+        created_at, closed_at,
+    ) -> Optional[Trade]:
+        """Insert a closed real-money trade synced from the kreation bridge's MT5
+        deal history (live_trade_sync.py). Idempotent on mt5_ticket — safe to call
+        repeatedly with the same ticket across sync cycles."""
+        db = SessionLocal()
+        try:
+            existing = db.query(Trade).filter(
+                Trade.mt5_ticket == mt5_ticket, Trade.account_type == 'live'
+            ).first()
+            if existing:
+                return existing
+            trade = Trade(
+                user_id=user_id,
+                trade_id=f"live-{mt5_ticket}",
+                symbol=symbol,
+                trade_type=trade_type,
+                amount=amount,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                profit_loss=profit_loss,
+                status='closed',
+                created_at=created_at,
+                closed_at=closed_at,
+                mt5_ticket=mt5_ticket,
+                account_type='live',
+            )
+            db.add(trade)
+            db.commit()
+            db.refresh(trade)
+            return trade
         finally:
             db.close()
 
