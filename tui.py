@@ -289,8 +289,10 @@ class DerivTradingApp(App):
     #history-table { height: 1fr; }
 
     /* ── Live (real-money bridge) ──────────── */
-    #live-top-bar      { height: 4; }
-    #live-account-panel { width: 1fr; }
+    #live-top-bar        { height: 7; }
+    #live-account-panel   { width: 36; }
+    #live-portfolio-panel { width: 1fr; }
+    #live-status-panel    { width: 26; }
     #live-split          { height: 1fr; }
     #live-positions-table { height: 40%; }
     #live-history-table   { height: 1fr; }
@@ -438,7 +440,9 @@ class DerivTradingApp(App):
             # ── Live (real-money MT5 account via kreation bridge) ────────────
             with TabPane("Live  [5]", id="tab-live"):
                 with Horizontal(id="live-top-bar"):
-                    yield Static("Connecting...", id="live-account-panel", classes="panel")
+                    yield Static("Connecting...", id="live-account-panel",   classes="panel")
+                    yield Static("",              id="live-portfolio-panel", classes="panel")
+                    yield Static("",              id="live-status-panel",   classes="panel")
                 with Vertical(id="live-split"):
                     yield DataTable(id="live-positions-table", classes="panel", cursor_type="row")
                     yield DataTable(id="live-history-table", classes="panel", cursor_type="row")
@@ -476,6 +480,9 @@ class DerivTradingApp(App):
 
         lp = self.query_one("#live-positions-table", DataTable)
         lp.add_columns("Ticket", "Symbol", "Dir", "Size", "Open", "Current", "P&L", "SL", "TP")
+        self.query_one("#live-account-panel", Static).border_title   = "Account"
+        self.query_one("#live-portfolio-panel", Static).border_title = "Portfolio"
+        self.query_one("#live-status-panel", Static).border_title    = "Status"
         lp.border_title = "Live — Open Positions"
 
         lh = self.query_one("#live-history-table", DataTable)
@@ -820,31 +827,53 @@ class DerivTradingApp(App):
         await self._fetch_history()
 
     async def _fetch_live_account(self) -> None:
-        panel = self.query_one("#live-account-panel", Static)
+        acct_panel = self.query_one("#live-account-panel", Static)
+        port_panel = self.query_one("#live-portfolio-panel", Static)
+        stat_panel = self.query_one("#live-status-panel", Static)
+
         if not BRIDGE_API_URL or not BRIDGE_API_TOKEN:
-            panel.update("[yellow]MT5_BRIDGE_URL / MT5_BRIDGE_TOKEN not set in .env — see mt5-bridge repo's hermes-skill/SKILL.md for the values.[/yellow]")
+            acct_panel.update("[yellow]MT5_BRIDGE_URL /\nMT5_BRIDGE_TOKEN\nnot set in .env[/yellow]")
+            port_panel.update("")
+            stat_panel.update("[bold red]● OFFLINE[/bold red]\nnot configured")
             return
         try:
             data = await bridge_get("/account")
             if not isinstance(data, dict) or data.get("error"):
-                panel.update(f"[red]Live account error: {data.get('error', 'unknown') if isinstance(data, dict) else 'bad response'}[/red]")
+                err = data.get("error", "unknown") if isinstance(data, dict) else "bad response"
+                acct_panel.update(f"[red]{err}[/red]")
+                port_panel.update("")
+                stat_panel.update(f"[bold red]● OFFLINE[/bold red]\n{BRIDGE_API_URL}")
                 return
+
             balance = data.get("balance") or 0
             equity = data.get("equity") or 0
             margin = data.get("margin") or 0
+            margin_free = data.get("margin_free") or 0
             profit = data.get("profit") or 0
             login = data.get("login", "—")
             server = data.get("server", "—")
             currency = data.get("currency", "")
+            leverage = data.get("leverage", "—")
+            trade_allowed = data.get("trade_allowed", False)
+
+            acct_panel.update(
+                f"[bold]{login}[/bold]\n{server}\n"
+                f"Balance: [bold]${balance:.2f}[/bold] {currency}"
+            )
             pnl_style = "bold green" if profit >= 0 else "bold red"
-            panel.update(
-                f"[bold red]● LIVE[/bold red]  {login} @ {server}   "
-                f"Balance: [bold]${balance:.2f}[/bold] {currency}   Equity: ${equity:.2f}   "
-                f"Margin: ${margin:.2f}   "
+            port_panel.update(
+                f"Equity: ${equity:.2f}   Margin: ${margin:.2f}   Free: ${margin_free:.2f}\n"
                 f"[{pnl_style}]Open P&L: ${profit:.2f}[/{pnl_style}]"
             )
+            stat_panel.update(
+                f"[bold red]● LIVE[/bold red]\n"
+                f"Leverage 1:{leverage}\n"
+                f"{'Trading enabled' if trade_allowed else '[red]Trading disabled[/red]'}"
+            )
         except Exception as e:
-            panel.update(f"[red]Live account error: {e}[/red]")
+            acct_panel.update(f"[red]Live account error: {e}[/red]")
+            port_panel.update("")
+            stat_panel.update("[bold red]● OFFLINE[/bold red]")
 
     @work(exclusive=True, group="live_account")
     async def refresh_live_account(self) -> None:
