@@ -49,6 +49,11 @@ load_dotenv()
 API_BASE = os.getenv("TRADING_API_URL", "http://trading.enigmata.local").rstrip("/")
 MCP_AGENT_USER_ID = os.getenv("MCP_AGENT_USER_ID", "hermes_agent")
 
+# Live (real-money) MT5 account — Laravel bridge on kreation, reached directly
+# over Tailscale (same pattern Hermes uses; the TUI does not go through stinger).
+BRIDGE_API_URL = os.getenv("MT5_BRIDGE_URL", "").rstrip("/")
+BRIDGE_API_TOKEN = os.getenv("MT5_BRIDGE_TOKEN", "")
+
 DEFAULT_SYMBOLS = ["R_50", "R_75", "R_100", "1HZ50V", "1HZ75V", "1HZ100V"]
 
 ALLOWED_SYMBOLS = sorted([
@@ -78,6 +83,19 @@ async def api_post(path: str, body: dict | None = None) -> dict[str, Any]:
         async with session.post(
             f"{API_BASE}{path}",
             json=body or {},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            return await r.json()
+
+
+async def bridge_get(path: str, params: dict | None = None) -> dict[str, Any]:
+    """GET against the Laravel MT5 bridge on kreation — the real-money account."""
+    headers = {"Authorization": f"Bearer {BRIDGE_API_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{BRIDGE_API_URL}{path}",
+            headers=headers,
+            params=params,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             return await r.json()
@@ -113,6 +131,16 @@ def local_time(iso_str, fmt: str = "%Y-%m-%d %H:%M") -> str:
         return dt.astimezone().strftime(fmt)
     except Exception:
         return str(iso_str)[:16].replace("T", " ")
+
+
+def mt5_epoch_local(epoch, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format an MT5 deal's Unix-epoch `time` field in the viewer's local timezone."""
+    if not epoch:
+        return "—"
+    try:
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).astimezone().strftime(fmt)
+    except Exception:
+        return "—"
 
 
 # ─── Trade Detail Modal ───────────────────────────────────────────────────────
@@ -260,6 +288,13 @@ class DerivTradingApp(App):
     /* ── History ───────────────────────────── */
     #history-table { height: 1fr; }
 
+    /* ── Live (real-money bridge) ──────────── */
+    #live-top-bar      { height: 4; }
+    #live-account-panel { width: 1fr; }
+    #live-split          { height: 1fr; }
+    #live-positions-table { height: 40%; }
+    #live-history-table   { height: 1fr; }
+
     /* ── Chart ─────────────────────────────── */
     #chart-controls { height: 3; padding: 0 1; align: left middle; }
     #chart-controls Label  { width: auto; padding: 0 1 0 2; content-align: left middle; }
@@ -293,6 +328,7 @@ class DerivTradingApp(App):
         Binding("2", "switch_tab('tab-agent')",     "Agent"),
         Binding("3", "switch_tab('tab-history')",   "History"),
         Binding("4", "switch_tab('tab-chart')",     "Chart"),
+        Binding("5", "switch_tab('tab-live')",      "Live"),
         Binding("r", "refresh_all",         "Refresh"),
         Binding("a", "toggle_auto_refresh", "Auto"),
         Binding("ctrl+l", "clear_log",      "Clear Log"),
@@ -326,6 +362,9 @@ class DerivTradingApp(App):
         self._chart_tf: str = "1m"
         self._chart_offset: int = 0     # candles scrolled back from the latest (0 = live edge)
         self._timer_chart: Optional[Timer] = None
+        self._timer_live_account: Optional[Timer] = None
+        self._timer_live_positions: Optional[Timer] = None
+        self._timer_live_history: Optional[Timer] = None
 
     # ─── Layout ──────────────────────────────────────────────────────────────
 
@@ -396,6 +435,14 @@ class DerivTradingApp(App):
                 yield PlotextPlot(id="chart-plot", classes="panel")
                 yield Static("Chart: idle", id="chart-status")
 
+            # ── Live (real-money MT5 account via kreation bridge) ────────────
+            with TabPane("Live  [5]", id="tab-live"):
+                with Horizontal(id="live-top-bar"):
+                    yield Static("Connecting...", id="live-account-panel", classes="panel")
+                with Vertical(id="live-split"):
+                    yield DataTable(id="live-positions-table", classes="panel", cursor_type="row")
+                    yield DataTable(id="live-history-table", classes="panel", cursor_type="row")
+
         yield Footer()
 
     # ─── Lifecycle ───────────────────────────────────────────────────────────
@@ -426,6 +473,14 @@ class DerivTradingApp(App):
         ht.add_columns("ID", "Symbol", "Dir", "Size", "Entry", "Exit", "P&L", "Closed")
         ht.border_title = "Trade History"
         self.query_one("#edge-panel", Static).border_title = "Signal Edge"
+
+        lp = self.query_one("#live-positions-table", DataTable)
+        lp.add_columns("Ticket", "Symbol", "Dir", "Size", "Open", "Current", "P&L", "SL", "TP")
+        lp.border_title = "Live — Open Positions"
+
+        lh = self.query_one("#live-history-table", DataTable)
+        lh.add_columns("Ticket", "Symbol", "Dir", "Size", "Open", "Close", "P&L", "Closed")
+        lh.border_title = "Live — Trade History (7d)"
 
         chart_plot = self.query_one("#chart-plot", PlotextPlot)
         chart_plot.border_title = "Candlestick Chart"
@@ -469,6 +524,9 @@ class DerivTradingApp(App):
         await self._fetch_history()
         await self._fetch_signals()
         await self._fetch_edge()
+        await self._fetch_live_account()
+        await self._fetch_live_positions()
+        await self._fetch_live_history()
 
         self._timer_ticks   = self.set_interval(1,  self.refresh_ticks)
         self._timer_balance = self.set_interval(30, self.refresh_balance)
@@ -479,6 +537,9 @@ class DerivTradingApp(App):
         self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
         self._timer_signals = self.set_interval(3, self.refresh_signals)
         self._timer_chart   = self.set_interval(2, self.refresh_chart)
+        self._timer_live_account   = self.set_interval(20, self.refresh_live_account)
+        self._timer_live_positions = self.set_interval(5, self.refresh_live_positions)
+        self._timer_live_history   = self.set_interval(30, self.refresh_live_history)
         self.refresh_chart()
 
     # ─── Data fetchers ────────────────────────────────────────────────────────
@@ -757,6 +818,135 @@ class DerivTradingApp(App):
     @work(exclusive=True, group="history")
     async def refresh_history(self) -> None:
         await self._fetch_history()
+
+    async def _fetch_live_account(self) -> None:
+        panel = self.query_one("#live-account-panel", Static)
+        if not BRIDGE_API_URL or not BRIDGE_API_TOKEN:
+            panel.update("[yellow]MT5_BRIDGE_URL / MT5_BRIDGE_TOKEN not set in .env — see mt5-bridge repo's hermes-skill/SKILL.md for the values.[/yellow]")
+            return
+        try:
+            data = await bridge_get("/account")
+            if not isinstance(data, dict) or data.get("error"):
+                panel.update(f"[red]Live account error: {data.get('error', 'unknown') if isinstance(data, dict) else 'bad response'}[/red]")
+                return
+            balance = data.get("balance") or 0
+            equity = data.get("equity") or 0
+            margin = data.get("margin") or 0
+            profit = data.get("profit") or 0
+            login = data.get("login", "—")
+            server = data.get("server", "—")
+            currency = data.get("currency", "")
+            pnl_style = "bold green" if profit >= 0 else "bold red"
+            panel.update(
+                f"[bold red]● LIVE[/bold red]  {login} @ {server}   "
+                f"Balance: [bold]${balance:.2f}[/bold] {currency}   Equity: ${equity:.2f}   "
+                f"Margin: ${margin:.2f}   "
+                f"[{pnl_style}]Open P&L: ${profit:.2f}[/{pnl_style}]"
+            )
+        except Exception as e:
+            panel.update(f"[red]Live account error: {e}[/red]")
+
+    @work(exclusive=True, group="live_account")
+    async def refresh_live_account(self) -> None:
+        await self._fetch_live_account()
+
+    async def _fetch_live_positions(self) -> None:
+        if not BRIDGE_API_URL or not BRIDGE_API_TOKEN:
+            return
+        try:
+            positions = await bridge_get("/positions")
+            if not isinstance(positions, list):
+                return
+            table = self.query_one("#live-positions-table", DataTable)
+            scroll_x, scroll_y = table.scroll_x, table.scroll_y
+            table.clear()
+            if not positions:
+                table.add_row("—", "No open positions", "—", "—", "—", "—", "—", "—", "—", key="empty")
+            else:
+                for p in positions:
+                    pnl = p.get("profit") or 0
+                    pnl_text = (Text(f"+${pnl:.2f}", style="bold green") if pnl >= 0
+                                else Text(f"-${abs(pnl):.2f}", style="bold red"))
+                    dir_text = (Text("▲ BUY", style="bold green") if p.get("type") == 0
+                                else Text("▼ SELL", style="bold red"))
+                    ticket = str(p.get("ticket", ""))
+                    sl, tp = p.get("sl") or 0, p.get("tp") or 0
+                    table.add_row(
+                        f"…{ticket[-6:]}" if len(ticket) > 6 else ticket,
+                        p.get("symbol", ""),
+                        dir_text,
+                        f"{p.get('volume', 0):.2f}",
+                        f"{p.get('price_open', 0):.5f}",
+                        f"{p.get('price_current', 0):.5f}",
+                        pnl_text,
+                        f"{sl:.5f}" if sl else "—",
+                        f"{tp:.5f}" if tp else "—",
+                        key=ticket,
+                    )
+            self.call_after_refresh(lambda: table.scroll_to(scroll_x, scroll_y, animate=False))
+        except Exception as e:
+            self._log(f"[red]Live positions error: {e}[/red]")
+
+    @work(exclusive=True, group="live_positions")
+    async def refresh_live_positions(self) -> None:
+        await self._fetch_live_positions()
+
+    async def _fetch_live_history(self) -> None:
+        if not BRIDGE_API_URL or not BRIDGE_API_TOKEN:
+            return
+        try:
+            deals = await bridge_get("/history", params={"days": 7})
+            if not isinstance(deals, list):
+                return
+            # The bridge returns raw MT5 deals (one IN + one OUT leg per closed
+            # position, linked by position_id) — pair them into one row per trade.
+            by_position: dict[Any, dict] = {}
+            for d in deals:
+                pos_id = d.get("position_id")
+                if pos_id is None:
+                    continue
+                row = by_position.setdefault(pos_id, {})
+                if d.get("entry") == 0:  # DEAL_ENTRY_IN
+                    row.update(
+                        open_price=d.get("price"), open_time=d.get("time"),
+                        dir="BUY" if d.get("type") == 0 else "SELL",
+                        volume=d.get("volume"), symbol=d.get("symbol"), ticket=pos_id,
+                    )
+                elif d.get("entry") == 1:  # DEAL_ENTRY_OUT
+                    row["close_price"] = d.get("price")
+                    row["close_time"] = d.get("time")
+                    row["profit"] = (row.get("profit") or 0) + (d.get("profit") or 0)
+
+            rows = [r for r in by_position.values() if "close_time" in r]
+            rows.sort(key=lambda r: r.get("close_time") or 0, reverse=True)
+
+            table = self.query_one("#live-history-table", DataTable)
+            scroll_x, scroll_y = table.scroll_x, table.scroll_y
+            table.clear()
+            for r in rows:
+                pnl = r.get("profit") or 0
+                pnl_text = (Text(f"+${pnl:.2f}", style="bold green") if pnl >= 0
+                            else Text(f"-${abs(pnl):.2f}", style="bold red"))
+                dir_text = (Text("▲ BUY", style="bold green") if r.get("dir") == "BUY"
+                            else Text("▼ SELL", style="bold red"))
+                ticket = str(r.get("ticket", ""))
+                table.add_row(
+                    f"…{ticket[-6:]}" if len(ticket) > 6 else ticket,
+                    r.get("symbol", ""),
+                    dir_text,
+                    f"{r.get('volume', 0):.2f}",
+                    f"{r.get('open_price', 0):.5f}",
+                    f"{r.get('close_price', 0):.5f}",
+                    pnl_text,
+                    mt5_epoch_local(r.get("close_time")),
+                )
+            self.call_after_refresh(lambda: table.scroll_to(scroll_x, scroll_y, animate=False))
+        except Exception as e:
+            self._log(f"[red]Live history error: {e}[/red]")
+
+    @work(exclusive=True, group="live_history")
+    async def refresh_live_history(self) -> None:
+        await self._fetch_live_history()
 
     async def _fetch_edge(self) -> None:
         try:
@@ -1289,7 +1479,8 @@ class DerivTradingApp(App):
     def action_toggle_auto_refresh(self) -> None:
         self._auto_refresh = not self._auto_refresh
         timers = [self._timer_ticks, self._timer_balance, self._timer_open, self._timer_market,
-                  self._timer_history, self._timer_agent, self._timer_chart]
+                  self._timer_history, self._timer_agent, self._timer_chart,
+                  self._timer_live_account, self._timer_live_positions, self._timer_live_history]
         if self._auto_refresh:
             self._timer_ticks   = self.set_interval(1,  self.refresh_ticks)
             self._timer_balance = self.set_interval(30, self.refresh_balance)
@@ -1299,6 +1490,9 @@ class DerivTradingApp(App):
             self._timer_edge    = self.set_interval(20, self.refresh_edge)
             self._timer_agent   = self.set_interval(5,  self.refresh_agent_activity)
             self._timer_chart   = self.set_interval(2, self.refresh_chart)
+            self._timer_live_account   = self.set_interval(20, self.refresh_live_account)
+            self._timer_live_positions = self.set_interval(5, self.refresh_live_positions)
+            self._timer_live_history   = self.set_interval(30, self.refresh_live_history)
             self._log("[green]Auto-refresh ON[/green]")
         else:
             for t in timers:
