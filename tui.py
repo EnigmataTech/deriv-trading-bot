@@ -367,7 +367,8 @@ class DerivTradingApp(App):
         self._timer_live_account: Optional[Timer] = None
         self._timer_live_positions: Optional[Timer] = None
         self._timer_live_history: Optional[Timer] = None
-        self._history_filter_live: bool = False  # click History's "Acct" header to toggle
+        # Click History's "Acct" header to cycle: all -> live -> demo -> all
+        self._history_filter: Optional[str] = None  # None | "live" | "demo"
 
     # ─── Layout ──────────────────────────────────────────────────────────────
 
@@ -788,15 +789,15 @@ class DerivTradingApp(App):
             if not resp.get("success"):
                 return
             trades = [t for t in resp.get("trades", []) if t.get("status") == "closed"]
-            if self._history_filter_live:
-                trades = [t for t in trades if t.get("account_type") == "live"]
+            if self._history_filter:
+                trades = [t for t in trades if t.get("account_type") == self._history_filter]
             trades.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
             table = self.query_one("#history-table", DataTable)
-            table.border_title = (
-                "Trade History — LIVE ONLY (click Acct to show all)"
-                if self._history_filter_live
-                else "Trade History (click Acct to filter to LIVE only)"
-            )
+            table.border_title = {
+                "live": "Trade History — LIVE ONLY (click Acct to cycle)",
+                "demo": "Trade History — DEMO ONLY (click Acct to cycle)",
+                None: "Trade History — ALL (click Acct to filter live/demo)",
+            }[self._history_filter]
             scroll_x, scroll_y = table.scroll_x, table.scroll_y  # preserve across redraw
             table.clear()
             for t in trades:
@@ -873,9 +874,26 @@ class DerivTradingApp(App):
                 f"Balance: [bold]${balance:.2f}[/bold] {currency}"
             )
             pnl_style = "bold green" if profit >= 0 else "bold red"
+            trades_line = ""
+            try:
+                summary = await api_get("/api/trades/summary?account_type=live")
+                if summary.get("success"):
+                    s = summary.get("data", {})
+                    closed = s.get("closed_trades", 0)
+                    realized = s.get("total_profit_loss", 0) or 0
+                    r_style = "bold green" if realized >= 0 else "bold red"
+                    trades_line = (
+                        f"\nTrades: {s.get('total_trades', 0)}  "
+                        f"Win Rate: {s.get('win_rate', 0):.1f}%  "
+                        f"({closed} closed)  "
+                        f"[{r_style}]Realized: ${realized:+.2f}[/{r_style}]"
+                    )
+            except Exception:
+                pass
             port_panel.update(
                 f"Equity: ${equity:.2f}   Margin: ${margin:.2f}   Free: ${margin_free:.2f}\n"
                 f"[{pnl_style}]Open P&L: ${profit:.2f}[/{pnl_style}]"
+                f"{trades_line}"
             )
             stat_panel.update(
                 f"[bold red]● LIVE[/bold red]\n"
@@ -1092,6 +1110,20 @@ class DerivTradingApp(App):
                     dcol = "dim"
                 icon = {"trade": "◆", "signal": "▸", "error": "✕",
                         "heartbeat": "♥"}.get(etype, "·")
+                if etype == "trade":
+                    # A signal actually fired a live order — make it stand out
+                    # from the run of silent scans instead of blending in.
+                    tid = a.get("trade_id")
+                    tid_part = f"  ticket …{str(tid)[-6:]}" if tid else ""
+                    log.write(f"[dim]{'─' * 44}[/dim]")
+                    log.write(
+                        f"[dim]{ts}[/dim] {icon} [{dcol} reverse] TRADE EXECUTED [/{dcol} reverse] "
+                        f"[bold]{sym}[/bold] [{dcol}]{decision}[/{dcol}]{tid_part}"
+                    )
+                    if detail:
+                        log.write(f"   [italic]↳ {str(detail)[:140]}[/italic]")
+                    log.write(f"[dim]{'─' * 44}[/dim]")
+                    continue
                 line = f"[dim]{ts}[/dim] {icon}"
                 if sym:
                     line += f" [bold]{sym}[/bold]"
@@ -1110,25 +1142,34 @@ class DerivTradingApp(App):
             self._log(f"[yellow]Agent stream error: {e}[/yellow]")
 
     async def _fetch_agent_summary(self) -> None:
-        """Win/loss summary strip atop the Agent tab, reusing /api/portfolio/stats."""
-        try:
-            resp = await api_get("/api/portfolio/stats")
-            if not resp.get("success"):
-                return
-            s = resp.get("stats", {})
+        """Win/loss summary strip atop the Agent tab — demo and live are shown
+        separately (they share a user_id in the DB, so a single combined figure
+        would blend a live/real-money book with the mostly-idle demo one)."""
+        def _line(label: str, s: dict) -> str:
             w = s.get("winning_trades", 0)
             l = s.get("losing_trades", 0)
             wr = s.get("win_rate", 0)
             net = s.get("total_pnl", 0) or 0
             openn = s.get("open_trades", 0)
             ncol = "green" if net >= 0 else "red"
-            self.query_one("#agent-summary", Static).update(
-                f"[bold]Hermes[/bold]   "
+            return (
+                f"{label}   "
                 f"W [green]{w}[/green] / L [red]{l}[/red]   "
                 f"win-rate [bold]{wr}%[/bold]   "
                 f"net [{ncol}]{net:+.2f}[/{ncol}]   "
                 f"open [cyan]{openn}[/cyan]"
             )
+        try:
+            live_resp, demo_resp = await asyncio.gather(
+                api_get("/api/portfolio/stats?account_type=live"),
+                api_get("/api/portfolio/stats?account_type=demo"),
+            )
+            lines = ["[bold]Hermes[/bold]"]
+            if live_resp.get("success"):
+                lines.append(_line("[bold red]LIVE[/bold red]", live_resp.get("stats", {})))
+            if demo_resp.get("success"):
+                lines.append(_line("[dim]demo[/dim]", demo_resp.get("stats", {})))
+            self.query_one("#agent-summary", Static).update("\n".join(lines))
         except Exception:
             pass
 
@@ -1471,10 +1512,10 @@ class DerivTradingApp(App):
             self.push_screen(TradeDetailModal(trade))
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
-        # Click the History table's "Acct" column header to toggle a live-only
-        # filter; click again to show everything.
+        # Click the History table's "Acct" column header to cycle the filter:
+        # all -> live -> demo -> all.
         if event.data_table.id == "history-table" and str(event.label) == "Acct":
-            self._history_filter_live = not self._history_filter_live
+            self._history_filter = {None: "live", "live": "demo", "demo": None}[self._history_filter]
             self.refresh_history()
 
     # ─── Actions ─────────────────────────────────────────────────────────────

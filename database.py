@@ -198,10 +198,13 @@ def get_db():
 class TradingRepository:
 
     @staticmethod
-    def get_trades_by_user(user_id: str) -> List[Trade]:
+    def get_trades_by_user(user_id: str, account_type: Optional[str] = None) -> List[Trade]:
         db = SessionLocal()
         try:
-            return db.query(Trade).filter(Trade.user_id == user_id).all()
+            q = db.query(Trade).filter(Trade.user_id == user_id)
+            if account_type:
+                q = q.filter(Trade.account_type == account_type)
+            return q.all()
         finally:
             db.close()
 
@@ -428,11 +431,16 @@ class TradingRepository:
             db.close()
 
     @staticmethod
-    def get_trades_summary(user_id: str) -> dict:
-        """Return a dict with summary stats: total_trades, open_trades, closed_trades, total_profit_loss, win_rate."""
+    def get_trades_summary(user_id: str, account_type: Optional[str] = None) -> dict:
+        """Return a dict with summary stats: total_trades, open_trades, closed_trades, total_profit_loss, win_rate.
+        Pass account_type='demo'|'live' to scope the stats to one book — demo and live
+        trades share the same user_id (both are hermes_agent), so without this they mix."""
         db = SessionLocal()
         try:
-            trades = db.query(Trade).filter(Trade.user_id == user_id).all()
+            q = db.query(Trade).filter(Trade.user_id == user_id)
+            if account_type:
+                q = q.filter(Trade.account_type == account_type)
+            trades = q.all()
 
             total_trades = len(trades)
             open_trades = sum(1 for t in trades if t.status == 'open')

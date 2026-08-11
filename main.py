@@ -2463,12 +2463,14 @@ async def api_check_trades(request: StarletteRequest) -> JSONResponse:
 
 @mcp.custom_route("/api/trades/summary", methods=["GET"])
 async def api_trades_summary(request: StarletteRequest) -> JSONResponse:
-    """Get trade summary for the current user"""
+    """Get trade summary for the current user. Optional ?account_type=demo|live
+    scopes the stats to one book (demo and live trades share a user_id)."""
     user_id, error_response = require_auth(request)
     if error_response:
         return error_response
     try:
-        summary = TradingRepository.get_trades_summary(user_id)
+        account_type = request.query_params.get("account_type") or None
+        summary = TradingRepository.get_trades_summary(user_id, account_type=account_type)
         return JSONResponse({"success": True, "data": summary})
     except Exception as e:
         log_error(e, "api_trades_summary")
@@ -2720,14 +2722,16 @@ async def api_open_trades(request: StarletteRequest) -> JSONResponse:
 
 @mcp.custom_route("/api/portfolio/stats", methods=["GET"])
 def api_portfolio_stats(request: StarletteRequest) -> JSONResponse:
-    """Get portfolio statistics for charts and displays"""
+    """Get portfolio statistics for charts and displays. Optional ?account_type=demo|live
+    scopes to one book (demo and live trades share a user_id, so they mix otherwise)."""
     user_id, error_response = require_auth(request)
     if error_response:
         return error_response
 
     try:
-        trades = TradingRepository.get_trades_by_user(user_id)
-        summary = TradingRepository.get_trades_summary(user_id)
+        account_type = request.query_params.get("account_type") or None
+        trades = TradingRepository.get_trades_by_user(user_id, account_type=account_type)
+        summary = TradingRepository.get_trades_summary(user_id, account_type=account_type)
 
         # Build P&L history for chart
         pnl_history = []
