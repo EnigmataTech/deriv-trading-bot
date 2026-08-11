@@ -1600,9 +1600,12 @@ class DerivTradingApp(App):
     # ─── Helpers ─────────────────────────────────────────────────────────────
 
     def _set_status(self, connected: bool) -> None:
+        # "DEMO" here means this dashboard's API connection is up — not to be
+        # confused with the Live tab's "● LIVE", which means the real-money
+        # MT5 account is connected. Kept distinct since we're live trading now.
         try:
             auto = "AUTO" if self._auto_refresh else "MANUAL"
-            status = "[bold green]● LIVE[/bold green]" if connected else "[bold red]● OFFLINE[/bold red]"
+            status = "[bold cyan]● DEMO[/bold cyan]" if connected else "[bold red]● OFFLINE[/bold red]"
             self.query_one("#status-panel", Static).update(f"{status}\n{API_BASE}\nRefresh: {auto}")
         except Exception:
             pass
