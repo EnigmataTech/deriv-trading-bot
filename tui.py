@@ -294,8 +294,9 @@ class DerivTradingApp(App):
     #live-portfolio-panel { width: 1fr; }
     #live-status-panel    { width: 26; }
     #live-split          { height: 1fr; }
-    #live-positions-table { height: 40%; }
-    #live-history-table   { height: 1fr; }
+    #live-positions-table { height: 30%; }
+    #live-history-table   { height: 40%; }
+    #live-activity-log    { height: 1fr; min-height: 6; }
 
     /* ── Chart ─────────────────────────────── */
     #chart-controls { height: 3; padding: 0 1; align: left middle; }
@@ -369,6 +370,14 @@ class DerivTradingApp(App):
         self._timer_live_history: Optional[Timer] = None
         # Click History's "Acct" header to cycle: all -> live -> demo -> all
         self._history_filter: Optional[str] = None  # None | "live" | "demo"
+        # Live-tab activity log: track what we've already logged so we only
+        # write a line on state *changes* (new position, newly-closed trade,
+        # breaker trip/reset), not every poll.
+        self._live_known_open_tickets: set[str] = set()
+        self._live_known_closed_tickets: set[str] = set()
+        self._live_breaker_tripped: Optional[bool] = None
+        self._live_positions_seeded: bool = False
+        self._live_history_seeded: bool = False
 
     # ─── Layout ──────────────────────────────────────────────────────────────
 
@@ -448,6 +457,7 @@ class DerivTradingApp(App):
                 with Vertical(id="live-split"):
                     yield DataTable(id="live-positions-table", classes="panel", cursor_type="row")
                     yield DataTable(id="live-history-table", classes="panel", cursor_type="row")
+                    yield RichLog(id="live-activity-log", markup=True, classes="panel", auto_scroll=False)
 
         yield Footer()
 
@@ -490,6 +500,7 @@ class DerivTradingApp(App):
         lh = self.query_one("#live-history-table", DataTable)
         lh.add_columns("Ticket", "Symbol", "Dir", "Size", "Open", "Close", "P&L", "Closed")
         lh.border_title = "Live — Trade History (7d)"
+        self.query_one("#live-activity-log", RichLog).border_title = "Live — Activity Log"
 
         chart_plot = self.query_one("#chart-plot", PlotextPlot)
         chart_plot.border_title = "Candlestick Chart"
@@ -900,6 +911,23 @@ class DerivTradingApp(App):
                 f"Leverage 1:{leverage}\n"
                 f"{'Trading enabled' if trade_allowed else '[red]Trading disabled[/red]'}"
             )
+
+            try:
+                risk = await bridge_get("/risk/status")
+                if isinstance(risk, dict) and "breaker_tripped" in risk:
+                    tripped = bool(risk["breaker_tripped"])
+                    if self._live_breaker_tripped is not None and tripped != self._live_breaker_tripped:
+                        if tripped:
+                            self._live_log(
+                                f"[bold red]🛑 DAILY LOSS BREAKER TRIPPED[/bold red] — "
+                                f"down {risk.get('loss', 0):.2f} (limit {risk.get('limit', 0):.2f}); "
+                                f"new orders blocked for the rest of today"
+                            )
+                        else:
+                            self._live_log("[bold green]✓ Daily loss breaker reset[/bold green] — new orders allowed")
+                    self._live_breaker_tripped = tripped
+            except Exception:
+                pass
         except Exception as e:
             acct_panel.update(f"[red]Live account error: {e}[/red]")
             port_panel.update("")
@@ -916,6 +944,23 @@ class DerivTradingApp(App):
             positions = await bridge_get("/positions")
             if not isinstance(positions, list):
                 return
+
+            current_tickets = {str(p.get("ticket", "")) for p in positions}
+            if self._live_positions_seeded:
+                for p in positions:
+                    ticket = str(p.get("ticket", ""))
+                    if ticket and ticket not in self._live_known_open_tickets:
+                        dir_word = "BUY" if p.get("type") == 0 else "SELL"
+                        dir_col = "bold green" if p.get("type") == 0 else "bold red"
+                        self._live_log(
+                            f"[{dir_col}]▲ OPENED {dir_word}[/{dir_col}] "
+                            f"{p.get('symbol', '')} {p.get('volume', 0):.2f} lot "
+                            f"@ {p.get('price_open', 0):.2f}  "
+                            f"…{ticket[-6:] if len(ticket) > 6 else ticket}"
+                        )
+            self._live_known_open_tickets = current_tickets
+            self._live_positions_seeded = True
+
             table = self.query_one("#live-positions-table", DataTable)
             scroll_x, scroll_y = table.scroll_x, table.scroll_y
             table.clear()
@@ -978,6 +1023,24 @@ class DerivTradingApp(App):
 
             rows = [r for r in by_position.values() if "close_time" in r]
             rows.sort(key=lambda r: r.get("close_time") or 0, reverse=True)
+
+            current_closed = {str(r.get("ticket", "")) for r in rows}
+            if self._live_history_seeded:
+                newly_closed = current_closed - self._live_known_closed_tickets
+                for r in rows:
+                    ticket = str(r.get("ticket", ""))
+                    if ticket in newly_closed:
+                        pnl = r.get("profit") or 0
+                        pnl_col = "bold green" if pnl >= 0 else "bold red"
+                        self._live_log(
+                            f"[{pnl_col}]● CLOSED[/{pnl_col}] {r.get('symbol', '')} "
+                            f"{r.get('dir', '')} {r.get('volume', 0):.2f} lot  "
+                            f"{r.get('open_price', 0):.2f} → {r.get('close_price', 0):.2f}  "
+                            f"[{pnl_col}]{pnl:+.2f}[/{pnl_col}]  "
+                            f"…{ticket[-6:] if len(ticket) > 6 else ticket}"
+                        )
+            self._live_known_closed_tickets = current_closed
+            self._live_history_seeded = True
 
             table = self.query_one("#live-history-table", DataTable)
             scroll_x, scroll_y = table.scroll_x, table.scroll_y
@@ -1621,6 +1684,13 @@ class DerivTradingApp(App):
         try:
             ts = datetime.now().strftime("%H:%M:%S")
             self.query_one("#activity-log", RichLog).write(f"[dim]{ts}[/dim] {message}")
+        except Exception:
+            pass
+
+    def _live_log(self, message: str) -> None:
+        try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.query_one("#live-activity-log", RichLog).write(f"[dim]{ts}[/dim] {message}")
         except Exception:
             pass
 
