@@ -135,3 +135,51 @@ class TechnicalIndicators:
         for i in range(period + 1, len(tr)):
             atr[i] = round(atr[i - 1] * (1 - k) + tr[i] * k, 5)
         return atr
+
+    @staticmethod
+    def calculate_adx(prices: List[float], period: int = 14) -> List[float]:
+        """Trend-strength (ADX), close-only proxy — same simplification as
+        calculate_atr, since the signal pipeline has no high/low series.
+        +DM/-DM derived from close-to-close movement, TR proxied by
+        |close[i]-close[i-1]|, both Wilder-smoothed into +DI/-DI/DX/ADX."""
+        n = len(prices)
+        if n < 2:
+            return [None] * n
+        plus_dm = [None] + [max(prices[i] - prices[i - 1], 0.0) for i in range(1, n)]
+        minus_dm = [None] + [max(prices[i - 1] - prices[i], 0.0) for i in range(1, n)]
+        tr = [None] + [abs(prices[i] - prices[i - 1]) for i in range(1, n)]
+
+        adx: List[Optional[float]] = [None] * n
+        if n < 2 * period + 1:
+            return adx
+
+        def wilder_smooth(series: List[float]) -> List[Optional[float]]:
+            out: List[Optional[float]] = [None] * n
+            out[period] = sum(series[1 : period + 1])
+            k = 1.0 / period
+            for i in range(period + 1, n):
+                out[i] = out[i - 1] * (1 - k) + series[i]
+            return out
+
+        sm_plus_dm = wilder_smooth(plus_dm)
+        sm_minus_dm = wilder_smooth(minus_dm)
+        sm_tr = wilder_smooth(tr)
+
+        dx: List[Optional[float]] = [None] * n
+        for i in range(period, n):
+            if not sm_tr[i]:
+                continue
+            plus_di = 100.0 * sm_plus_dm[i] / sm_tr[i]
+            minus_di = 100.0 * sm_minus_dm[i] / sm_tr[i]
+            denom = plus_di + minus_di
+            dx[i] = 100.0 * abs(plus_di - minus_di) / denom if denom else 0.0
+
+        first_dx = 2 * period
+        valid_dx = [v for v in dx[period : first_dx + 1] if v is not None]
+        if not valid_dx:
+            return adx
+        adx[first_dx] = round(sum(valid_dx) / len(valid_dx), 5)
+        k = 1.0 / period
+        for i in range(first_dx + 1, n):
+            adx[i] = round(adx[i - 1] * (1 - k) + dx[i] * k, 5)
+        return adx

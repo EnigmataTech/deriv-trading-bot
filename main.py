@@ -783,17 +783,35 @@ async def _get_signal_cached(symbol: str) -> dict:
     return sig
 
 
+
+# Score threshold for a BUY/SELL call in _compute_market_signal. Default 2 is
+# the research-validated entry (2026-06-16 post-mortem: 75% win, PF ~3).
+# Lowering this (e.g. to 1) trades far more often but on an unvalidated,
+# weaker signal — no backtest data supports it having a real edge. Kept
+# separate from AUTOTRADE_THRESHOLD (the deterministic autotrader's own
+# knob) so the two can be tuned independently.
+SIGNAL_SCORE_THRESHOLD = int(os.getenv("SIGNAL_SCORE_THRESHOLD", "2"))
+
+# Minimum ADX(14) to allow a trade at all — gates BOTH directions. Added
+# 2026-08-11 after live evidence: overnight BUYs during a choppy/reversing
+# market (weak trend) lost, while afternoon BUYs during a real ~900pt runup
+# swept 4/5 TPs. ADX measures trend strength directly, which RSI/MACD/BB/EMA
+# don't — below this, sit out regardless of score.
+ADX_MIN_THRESHOLD = float(os.getenv("ADX_MIN_THRESHOLD", "20"))
+
+
 def _compute_market_signal(symbol: str, prices: list) -> dict:
     """Score-based composite signal: RSI / MACD-hist / BB-position summed to BUY/SELL/HOLD,
-    gated by a 50-EMA trend filter (longs only above EMA — the one component every
-    source in 2026-06-16 research agreed on). Also returns ATR-based suggested SL/TP
-    (1.5x ATR stop, 2:1 reward) for the caller to attach to a live order.
-    Caller is responsible for applying the streak-risk pause override."""
+    gated by a 50-EMA trend filter (long above EMA, short below EMA — the one
+    component every source in 2026-06-16 research agreed on) and an ADX(14)
+    trend-strength filter (both directions, see ADX_MIN_THRESHOLD). Also returns
+    ATR-based suggested SL/TP (1.5x ATR stop, 2:1 reward) for the caller to attach
+    to a live order. Caller is responsible for applying the streak-risk pause override."""
     if len(prices) < 55:
         return {
             "symbol": symbol,
             "current_price": prices[-1] if prices else None,
-            "rsi": None, "macd": None, "bb": None, "ema50": None, "atr": None,
+            "rsi": None, "macd": None, "bb": None, "ema50": None, "atr": None, "adx": None,
             "composite_score": 0,
             "call": "HOLD",
             "reason": f"insufficient bars ({len(prices)} < 55)",
@@ -859,27 +877,44 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
     atr_vals = TechnicalIndicators.calculate_atr(prices, 14)
     atr = next((x for x in reversed(atr_vals) if x is not None), None)
 
+    adx_vals = TechnicalIndicators.calculate_adx(prices, 14)
+    adx = next((x for x in reversed(adx_vals) if x is not None), None)
+
     score = rsi_score + macd_score + bb_score
-    if score >= 2:
+    if score >= SIGNAL_SCORE_THRESHOLD:
         call = "BUY"
-    elif score <= -2:
+    elif score <= -SIGNAL_SCORE_THRESHOLD:
         call = "SELL"
     else:
         call = "HOLD"
 
     trend_note = None
-    # 50-EMA trend filter — only long above the EMA. The single component
-    # every source in the 2026-06-16 research converged on; applied to BUY
-    # only since the bot is longs-only elsewhere too.
+    # 50-EMA trend filter — trade with the trend only (long above EMA, short
+    # below it). The single component every source in the 2026-06-16 research
+    # converged on.
     if call == "BUY" and ema50 is not None and current <= ema50:
         call = "HOLD"
         trend_note = f"BUY blocked by trend filter — price {current:.2f} below 50-EMA {ema50:.2f}"
+    elif call == "SELL" and ema50 is not None and current >= ema50:
+        call = "HOLD"
+        trend_note = f"SELL blocked by trend filter — price {current:.2f} above 50-EMA {ema50:.2f}"
+
+    # ADX trend-strength filter — sit out on both directions when the trend
+    # (if any) is too weak to trust, regardless of score/EMA side.
+    if call in ("BUY", "SELL") and adx is not None and adx < ADX_MIN_THRESHOLD:
+        blocked_call = call
+        call = "HOLD"
+        trend_note = f"{blocked_call} blocked by ADX filter — ADX {adx:.1f} below {ADX_MIN_THRESHOLD:.0f} (weak/no trend)"
 
     suggested_sl = suggested_tp = None
     if call == "BUY" and atr is not None and atr > 0:
         stop_dist = 1.5 * atr
         suggested_sl = round(current - stop_dist, 5)
         suggested_tp = round(current + stop_dist * 2, 5)  # 2:1 reward:risk
+    elif call == "SELL" and atr is not None and atr > 0:
+        stop_dist = 1.5 * atr
+        suggested_sl = round(current + stop_dist, 5)
+        suggested_tp = round(current - stop_dist * 2, 5)  # 2:1 reward:risk
 
     reason_parts = []
     if rsi_label not in ("neutral", "n/a"):
@@ -900,6 +935,7 @@ def _compute_market_signal(symbol: str, prices: list) -> dict:
         "bb": {"position": bb_pos, "score": bb_score, "upper": u, "lower": l},
         "ema50": ema50,
         "atr": atr,
+        "adx": adx,
         "composite_score": score,
         "call": call,
         "reason": reason,
@@ -1525,8 +1561,12 @@ async def get_market_signal(symbol: str) -> str:
     if sig.get("ema50") is not None:
         trend_line = f"50-EMA:  {sig['ema50']:.5f}  (price {'above' if sig['current_price'] > sig['ema50'] else 'at/below'})\n"
 
+    adx_line = ""
+    if sig.get("adx") is not None:
+        adx_line = f"ADX(14): {sig['adx']:.1f}  ({'trending' if sig['adx'] >= ADX_MIN_THRESHOLD else 'weak/no trend'})\n"
+
     sl_tp_line = ""
-    if sig["call"] == "BUY" and sig.get("suggested_sl") is not None:
+    if sig["call"] in ("BUY", "SELL") and sig.get("suggested_sl") is not None:
         sl_tp_line = (
             f"ATR(14): {sig['atr']:.5f}\n"
             f"Suggested SL: {sig['suggested_sl']}   Suggested TP: {sig['suggested_tp']}"
@@ -1540,6 +1580,7 @@ async def get_market_signal(symbol: str) -> str:
         f"MACD-h:  {sig['macd']['hist']:+.5f} [{sig['macd']['label']}]  ({sig['macd']['score']:+d})\n"
         f"BB-pos:  {sig['bb']['position']}  ({sig['bb']['score']:+d})\n"
         f"{trend_line}"
+        f"{adx_line}"
         f"Score:   {sig['composite_score']:+d}\n"
         f"Call:    {sig['call']}\n"
         f"{sl_tp_line}"
