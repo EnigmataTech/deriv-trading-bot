@@ -367,6 +367,7 @@ class DerivTradingApp(App):
         self._timer_live_account: Optional[Timer] = None
         self._timer_live_positions: Optional[Timer] = None
         self._timer_live_history: Optional[Timer] = None
+        self._history_filter_live: bool = False  # click History's "Acct" header to toggle
 
     # ─── Layout ──────────────────────────────────────────────────────────────
 
@@ -787,8 +788,15 @@ class DerivTradingApp(App):
             if not resp.get("success"):
                 return
             trades = [t for t in resp.get("trades", []) if t.get("status") == "closed"]
+            if self._history_filter_live:
+                trades = [t for t in trades if t.get("account_type") == "live"]
             trades.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
             table = self.query_one("#history-table", DataTable)
+            table.border_title = (
+                "Trade History — LIVE ONLY (click Acct to show all)"
+                if self._history_filter_live
+                else "Trade History (click Acct to filter to LIVE only)"
+            )
             scroll_x, scroll_y = table.scroll_x, table.scroll_y  # preserve across redraw
             table.clear()
             for t in trades:
@@ -1461,6 +1469,13 @@ class DerivTradingApp(App):
         trade = self._open_trade_rows.get(str(event.row_key.value))
         if trade:
             self.push_screen(TradeDetailModal(trade))
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        # Click the History table's "Acct" column header to toggle a live-only
+        # filter; click again to show everything.
+        if event.data_table.id == "history-table" and str(event.label) == "Acct":
+            self._history_filter_live = not self._history_filter_live
+            self.refresh_history()
 
     # ─── Actions ─────────────────────────────────────────────────────────────
 
