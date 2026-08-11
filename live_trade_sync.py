@@ -9,14 +9,17 @@ the TUI's Live tab, which queries the bridge directly. Only trades that have
 actually closed get persisted, once, idempotently on mt5_ticket.
 """
 import asyncio
+import json
 import os
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 
 from database import TradingRepository
+from notify import notify_telegram
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,79 @@ BRIDGE_TOKEN = os.getenv("MT5_BRIDGE_TOKEN", "")
 SYNC_INTERVAL = int(os.getenv("LIVE_TRADE_SYNC_INTERVAL", "180"))
 HISTORY_DAYS = int(os.getenv("LIVE_TRADE_SYNC_DAYS", "30"))
 LIVE_TRADE_USER_ID = os.getenv("LIVE_TRADE_USER_ID", "hermes_agent")
+
+RISK_ALERT_STATE_FILE = Path(
+    os.getenv("RISK_ALERT_STATE_FILE", str(Path.home() / ".deriv_bot_risk_alert_state.json"))
+)
+
+
+async def _send_telegram(text: str) -> None:
+    await asyncio.to_thread(notify_telegram, text)
+
+
+def _trade_closed_message(t: Dict[str, Any]) -> str:
+    profit = float(t.get("profit") or 0)
+    emoji = "🟢" if profit >= 0 else "🔴"
+    return (
+        f"{emoji} Live trade closed — {t['symbol']}\n"
+        f"{t['dir'].upper()} {t['volume']} lot | "
+        f"{t['open_price']:.2f} → {t['close_price']:.2f}\n"
+        f"P&L: {profit:+.2f}"
+    )
+
+
+async def _fetch_risk_status() -> Optional[Dict[str, Any]]:
+    if not BRIDGE_URL or not BRIDGE_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{BRIDGE_URL}/risk/status",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    return None
+                return await r.json()
+    except Exception as e:
+        logger.warning("live_trade_sync: risk status fetch error: %s", e)
+        return None
+
+
+def _load_alerted_date() -> Optional[str]:
+    try:
+        return json.loads(RISK_ALERT_STATE_FILE.read_text()).get("alerted_date")
+    except Exception:
+        return None
+
+
+def _save_alerted_date(date_str: str) -> None:
+    try:
+        RISK_ALERT_STATE_FILE.write_text(json.dumps({"alerted_date": date_str}))
+    except Exception as e:
+        logger.warning("live_trade_sync: failed to persist risk alert state: %s", e)
+
+
+async def check_daily_loss_breaker() -> None:
+    """Alert once per trading day the moment the bridge's daily loss breaker
+    trips, so a run of losses doesn't go unnoticed the way SL/time-stop
+    closes previously did."""
+    status = await _fetch_risk_status()
+    if not status or not status.get("breaker_tripped"):
+        return
+
+    trading_date = status.get("trading_date")
+    if _load_alerted_date() == trading_date:
+        return  # already alerted for today
+
+    loss = status.get("loss")
+    limit = status.get("limit")
+    await _send_telegram(
+        "🛑 Daily loss limit hit — new live trades are blocked for the rest of today.\n"
+        f"Down {loss:.2f} (limit {limit:.2f}), starting equity {status.get('starting_equity'):.2f}."
+    )
+    _save_alerted_date(trading_date)
 
 
 async def _fetch_deals() -> Optional[List[Dict[str, Any]]]:
@@ -91,6 +167,7 @@ async def sync_live_trades() -> Dict[str, int]:
                 closed_at=datetime.fromtimestamp(t["close_time"], tz=timezone.utc),
             )
             inserted += 1
+            await _send_telegram(_trade_closed_message(t))
         except Exception as e:
             logger.warning("live_trade_sync: failed to upsert ticket %s: %s", ticket, e)
 
@@ -110,3 +187,8 @@ async def live_trade_sync_loop() -> None:
                 )
         except Exception as e:
             logger.warning("live_trade_sync loop error: %s", e)
+
+        try:
+            await check_daily_loss_breaker()
+        except Exception as e:
+            logger.warning("live_trade_sync: daily loss breaker check error: %s", e)
