@@ -8,6 +8,7 @@ from starlette.responses import JSONResponse, Response, HTMLResponse
 from datetime import datetime
 from database import TradingRepository
 from indicators import TechnicalIndicators
+from patterns import analyze_pattern
 from symbols import get_symbol_display_name
 from analytics import (
     ClosedTrade,
@@ -1526,6 +1527,50 @@ def analyze_streak_risk() -> str:
             f"({r['pct_of_historical_max']:.0f}% of max){flag}"
         )
 
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_pattern_signal(symbol: str) -> str:
+    """Detect W (double-bottom) / M (double-top) reversal patterns on M15 OHLC.
+
+    OBSERVATION ONLY — a separate, unvalidated-at-scale module (see patterns.py
+    and backtest_patterns.py), not wired into get_market_signal, the autotrade
+    loop, or any execution path. Backtest against ~10 days of R_75 M15 data
+    (capped by the candles API's 1000-bar limit) showed a 76.5% win rate / PF
+    2.45, holding up (PF 1.0-3.1, always net-positive) across a parameter
+    sweep — encouraging, but small-sample. Treat as forward-test/paper stage.
+    Accepts MT5 names or legacy Deriv codes (R_75) under BROKER=mt5."""
+    if BROKER == "mt5":
+        symbol = get_symbol_display_name(symbol)
+    client = await get_deriv_client()
+    response = await client.get_candles(symbol, granularity=900, count=200)
+    if 'error' in response:
+        return f"Error: {response['error']['message']}"
+    candles = response.get('candles', [])
+    if len(candles) < 20:
+        return f"Not enough candles for {symbol} ({len(candles)})"
+
+    highs = [c['high'] for c in candles]
+    lows = [c['low'] for c in candles]
+    current = candles[-1]['close']
+    result = analyze_pattern(highs, lows, current)
+
+    if not result.pattern:
+        return f"=== Pattern Signal for {symbol} (M15) ===\nNo W/M pattern detected. ({result.detail})"
+
+    status = "CONFIRMED" if result.confirmed else "forming (unconfirmed)"
+    lines = [
+        f"=== Pattern Signal for {symbol} (M15) ===",
+        f"Pattern:  {result.pattern} ({'double bottom' if result.pattern == 'W' else 'double top'}) — {status}",
+        f"Price:    {current:.2f}",
+        f"Neckline: {result.neckline:.2f}",
+        f"Pivot 1:  {result.p1.price:.2f}",
+        f"Pivot 2:  {result.p2.price:.2f}",
+    ]
+    if result.confirmed:
+        lines.append(f"Target:   {result.target:.2f}  (measured move from neckline)")
+    lines.append(f"Why:      {result.detail}")
     return "\n".join(lines)
 
 
