@@ -1530,16 +1530,23 @@ def analyze_streak_risk() -> str:
     return "\n".join(lines)
 
 
+PATTERN_STOP_BUFFER_PCT = float(os.getenv("PATTERN_STOP_BUFFER_PCT", "0.05"))
+
+
 @mcp.tool()
 async def get_pattern_signal(symbol: str) -> str:
     """Detect W (double-bottom) / M (double-top) reversal patterns on M15 OHLC.
 
-    OBSERVATION ONLY — a separate, unvalidated-at-scale module (see patterns.py
-    and backtest_patterns.py), not wired into get_market_signal, the autotrade
-    loop, or any execution path. Backtest against ~10 days of R_75 M15 data
-    (capped by the candles API's 1000-bar limit) showed a 76.5% win rate / PF
-    2.45, holding up (PF 1.0-3.1, always net-positive) across a parameter
-    sweep — encouraging, but small-sample. Treat as forward-test/paper stage.
+    A separate signal path from get_market_signal — reversal-based (needs a
+    swing structure, not a sustained trend), so it's meant to catch the erratic
+    chop that Volatility indices spend most of their time in, which the
+    trend-following stack (RSI/MACD/BB/EMA/ADX) largely sits out. Backtested
+    (backtest_patterns.py) against ~10 days of R_75 M15 data: 76.5% win rate,
+    PF 2.45, holding up (PF 1.0-3.1, always net-positive) across a parameter
+    sweep — small sample, so wired to live execution 2026-08-14 with the same
+    guardrails as everything else (mandatory SL/TP, daily loss breaker,
+    one-position-at-a-time). Call == BUY for a confirmed W, SELL for a
+    confirmed M; HOLD otherwise. Suggested SL/TP included when confirmed.
     Accepts MT5 names or legacy Deriv codes (R_75) under BROKER=mt5."""
     if BROKER == "mt5":
         symbol = get_symbol_display_name(symbol)
@@ -1557,7 +1564,18 @@ async def get_pattern_signal(symbol: str) -> str:
     result = analyze_pattern(highs, lows, current)
 
     if not result.pattern:
-        return f"=== Pattern Signal for {symbol} (M15) ===\nNo W/M pattern detected. ({result.detail})"
+        return f"=== Pattern Signal for {symbol} (M15) ===\nCall: HOLD\nNo W/M pattern detected. ({result.detail})"
+
+    call = "HOLD"
+    suggested_sl = suggested_tp = None
+    if result.confirmed:
+        call = "BUY" if result.pattern == "W" else "SELL"
+        buffer = result.neckline * PATTERN_STOP_BUFFER_PCT / 100
+        if result.pattern == "W":
+            suggested_sl = round(min(result.p1.price, result.p2.price) - buffer, 5)
+        else:
+            suggested_sl = round(max(result.p1.price, result.p2.price) + buffer, 5)
+        suggested_tp = round(result.target, 5)
 
     status = "CONFIRMED" if result.confirmed else "forming (unconfirmed)"
     lines = [
@@ -1567,9 +1585,11 @@ async def get_pattern_signal(symbol: str) -> str:
         f"Neckline: {result.neckline:.2f}",
         f"Pivot 1:  {result.p1.price:.2f}",
         f"Pivot 2:  {result.p2.price:.2f}",
+        f"Call:     {call}",
     ]
     if result.confirmed:
         lines.append(f"Target:   {result.target:.2f}  (measured move from neckline)")
+        lines.append(f"Suggested SL: {suggested_sl}   Suggested TP: {suggested_tp}")
     lines.append(f"Why:      {result.detail}")
     return "\n".join(lines)
 
